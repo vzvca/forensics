@@ -202,6 +202,11 @@ static bool attr_get(struct dw_file *f, const unsigned char **p, uint64_t form,
         *p += len;
         break;
     }
+    case DW_FORM_block1: {
+        uint64_t len = rd_u(p, 1);
+        *p += len;
+        break;
+    }
     case DW_FORM_block2: {
         uint64_t len = rd_u(p, 2);
         *p += len;
@@ -218,14 +223,6 @@ static bool attr_get(struct dw_file *f, const unsigned char **p, uint64_t form,
         return false;
     }
     return true;
-}
-
-static void skip_rest(struct dw_file *f, const unsigned char **p,
-                      const struct abbrev *ab, int from)
-{
-    uint64_t u;
-    for (int i = from; i < ab->nattrs; i++)
-        attr_get(f, p, ab->attrs[i].form, ab->attrs[i].ic, &u, NULL, NULL);
 }
 
 static enum arg_type base_to_arg(uint64_t enc, uint64_t bytes)
@@ -259,26 +256,66 @@ static enum arg_type classify_type(struct dw_file *f, uint64_t die_start,
                                    uint64_t abbrev_off, uint64_t type_off,
                                    uint64_t cu_end, int depth);
 
+#define DW_MAX_DEPTH 64
+
+/* Sequential DIE cursor that respects the tree structure: a null abbrev
+ * code closes one level of children. Returns the offset of the next DIE,
+ * or UINT64_MAX on parse error. `die_off` receives the offset of the DIE
+ * just read; `code_out`/`ab_out` its abbrev info (ab_out may be NULL). */
+static uint64_t next_die(struct dw_file *f, const unsigned char **cur,
+                         const unsigned char *end, uint64_t abbrev_off,
+                         int *depth, uint64_t *die_off,
+                         uint64_t *code_out, struct abbrev *ab_out)
+{
+    const unsigned char *p = *cur;
+    *die_off = (uint64_t)(p - f->info);
+    uint64_t code = rd_leb(&p, false);
+    if (code == 0) {
+        if (*depth > 0)
+            (*depth)--;
+        *cur = p;
+        *code_out = 0;
+        return (uint64_t)(p - f->info);
+    }
+    struct abbrev ab;
+    if (!abbrev_at(f, abbrev_off, code, &ab))
+        return UINT64_MAX;
+    for (int i = 0; i < ab.nattrs; i++) {
+        uint64_t u;
+        if (!attr_get(f, &p, ab.attrs[i].form, ab.attrs[i].ic, &u, NULL, NULL))
+            return UINT64_MAX;
+    }
+    if (ab.has_children)
+        (*depth)++;
+    if (p > end)
+        return UINT64_MAX;
+    if (ab_out)
+        *ab_out = ab;
+    *code_out = code;
+    *cur = p;
+    return (uint64_t)(*die_off);
+}
+
 static const unsigned char *die_at(struct dw_file *f, uint64_t die_start,
                                   uint64_t abbrev_off, uint64_t target_off,
                                   uint64_t cu_end)
 {
-    if (target_off >= f->info_size || f->info + target_off >= f->info + cu_end)
+    if (target_off >= f->info_size || target_off >= cu_end)
         return NULL;
-    const unsigned char *target = f->info + target_off;
-    const unsigned char *scan = f->info + die_start;
-    while (scan < target) {
-        uint64_t code = rd_leb(&scan, false);
-        if (code == 0) {
-            /* end-of-children marker: keep scanning sequentially */
-            continue;
-        }
-        struct abbrev ab;
-        if (!abbrev_at(f, abbrev_off, code, &ab))
+    const unsigned char *cur = f->info + die_start;
+    const unsigned char *end = f->info + cu_end;
+    int depth = 0;
+    while (cur < end) {
+        uint64_t die_off, code;
+        uint64_t r = next_die(f, &cur, end, abbrev_off, &depth, &die_off, &code, NULL);
+        if (r == UINT64_MAX)
             return NULL;
-        skip_rest(f, &scan, &ab, 0);
+        if (die_off == target_off)
+            return f->info + target_off;
+        if (die_off > target_off)
+            return NULL;
     }
-    return scan == target ? target : NULL;
+    return NULL;
 }
 
 static enum arg_type die_classify(struct dw_file *f, const unsigned char *die,
@@ -435,28 +472,43 @@ bool dwarf_func_prototype(const char *elf_path, const char *func_name,
         if (version >= 5) {
             h += 1; /* unit_type */
             h += 1; /* address_size */
+            abbrev_off = dwarf64 ? rd_u(&h, 8) : rd_u(&h, 4);
+        } else {
+            /* DWARF 2/3/4: abbrev_offset then address_size */
+            abbrev_off = dwarf64 ? rd_u(&h, 8) : rd_u(&h, 4);
+            h += 1; /* address_size */
         }
-        abbrev_off = dwarf64 ? rd_u(&h, 8) : rd_u(&h, 4);
 
         const unsigned char *p = f.info + cu_end;
         const unsigned char *cur = h;
         uint64_t die_start_off = (uint64_t)(h - f.info);
         uint64_t cu_end_off = cu_end;
 
+        int depth = 0;
         while (cur < p && !found) {
-            uint64_t die_off = (uint64_t)(cur - f.info);
-            uint64_t code = rd_leb(&cur, false);
-            if (code == 0) {
-                /* end of children level: skip to next sibling guess */
-                continue;
-            }
             struct abbrev ab;
-            if (!abbrev_at(&f, abbrev_off, code, &ab))
-                break;
+            uint64_t code;
+            {
+                /* read DIE fully with attribute values */
+                const unsigned char *q = cur;
+                code = rd_leb(&q, false);
+                if (code == 0) {
+                    if (depth > 0)
+                        depth--;
+                    cur = q;
+                    continue;
+                }
+                if (!abbrev_at(&f, abbrev_off, code, &ab))
+                    break;
+                if (ab.has_children)
+                    depth++;
+                cur = q;
+            }
 
             const char *name = NULL;
             uint64_t type_ref = 0;
             bool is_subprogram = (ab.tag == DW_TAG_subprogram);
+            bool has_children = ab.has_children;
 
             for (int i = 0; i < ab.nattrs; i++) {
                 uint64_t u;
@@ -470,7 +522,7 @@ bool dwarf_func_prototype(const char *elf_path, const char *func_name,
                 else if (ab.attrs[i].at == DW_AT_type)
                     type_ref = u;
             }
-            int consumed = ab.nattrs; /* all attributes were read above */
+            (void)has_children;
 
             if (is_subprogram && name && strcmp(name, func_name) == 0) {
                 int na = 0;
@@ -480,37 +532,63 @@ bool dwarf_func_prototype(const char *elf_path, const char *func_name,
                                                type_ref, cu_end_off, 0))
                     : RET_NONE;
 
-                /* Children: formal_parameter and variadic entries. */
-                const unsigned char *c = cur;
-                while (c < p && na < 8) {
-                    uint64_t ccode = rd_leb(&c, false);
-                    if (ccode == 0)
-                        break;
-                    struct abbrev cab;
-                    if (!abbrev_at(&f, abbrev_off, ccode, &cab))
-                        break;
-                    uint64_t cref = 0;
-                    for (int i = 0; i < cab.nattrs; i++) {
-                        uint64_t u;
-                        const char *s;
-                        bool is_str;
-                        if (!attr_get(&f, &c, cab.attrs[i].form, cab.attrs[i].ic,
-                                      &u, &s, &is_str))
+                /* Children: formal_parameter / unspecified_parameters. */
+                if (has_children) {
+                    int cdepth = 1;
+                    const unsigned char *c = cur;
+                    while (c < p && cdepth > 0 && na < 7) {
+                        uint64_t ccode;
+                        struct abbrev cab;
+                        const unsigned char *q = c;
+                        ccode = rd_leb(&q, false);
+                        if (ccode == 0) {
+                            cdepth--;
+                            c = q;
+                            continue;
+                        }
+                        if (!abbrev_at(&f, abbrev_off, ccode, &cab))
                             break;
-                        if (cab.attrs[i].at == DW_AT_type)
-                            cref = u;
+                        uint64_t cref = 0;
+                        for (int i = 0; i < cab.nattrs; i++) {
+                            uint64_t u;
+                            const char *s;
+                            bool is_str;
+                            if (!attr_get(&f, &q, cab.attrs[i].form,
+                                          cab.attrs[i].ic, &u, &s, &is_str))
+                                break;
+                            if (cab.attrs[i].at == DW_AT_type)
+                                cref = u;
+                        }
+                        c = q;
+                        if (cab.tag == DW_TAG_formal_parameter && cref) {
+                            args[na++] = classify_type(&f, die_start_off,
+                                                       abbrev_off, cref,
+                                                       cu_end_off, 0);
+                        } else if (cab.tag == DW_TAG_unspecified_parameters) {
+                            break; /* variadic: stop decoding */
+                        }
+                        if (cab.has_children) {
+                            /* skip the whole subtree of this child */
+                            int sdepth = 1;
+                            while (c < p && sdepth > 0) {
+                                uint64_t scode = rd_leb(&c, false);
+                                if (scode == 0) {
+                                    sdepth--;
+                                    continue;
+                                }
+                                struct abbrev sab;
+                                if (!abbrev_at(&f, abbrev_off, scode, &sab))
+                                    break;
+                                uint64_t u;
+                                for (int i = 0; i < sab.nattrs; i++)
+                                    if (!attr_get(&f, &c, sab.attrs[i].form,
+                                                  sab.attrs[i].ic, &u, NULL, NULL))
+                                        break;
+                                if (sab.has_children)
+                                    sdepth++;
+                            }
+                        }
                     }
-                    if (cab.tag == DW_TAG_formal_parameter && cref)
-                        args[na++] = classify_type(&f, die_start_off, abbrev_off,
-                                                   cref, cu_end_off, 0);
-                    else if (cab.tag == DW_TAG_unspecified_parameters) {
-                        args[na++] = TYPE_END; /* variadic: stop decoding */
-                        break;
-                    }
-                    if (!cab.has_children)
-                        continue;
-                    /* descend into child only for nested subprograms we
-                     * do not need: skip whole subtree crudely */
                 }
                 for (int i = na; i < 8; i++)
                     args[i] = TYPE_END;
@@ -538,8 +616,6 @@ bool dwarf_func_prototype(const char *elf_path, const char *func_name,
                 break;
             }
 
-            skip_rest(&f, &cur, &ab, consumed);
-            (void)die_off;
         }
         cu = f.info + cu_end;
     }

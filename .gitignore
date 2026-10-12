@@ -1,3 +1,4 @@
 symfind
 symtrace
 elfparse.o
+dwarg.o

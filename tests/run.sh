@@ -195,6 +195,23 @@ else
     fail=1
 fi
 
+
+# DWARF version compatibility (gcc 10 defaults to DWARF 4)
+gcc -gdwarf-4 -g -O0 -shared -fPIC -o "$TMP/libgreet4.so" "$TMP/greetlib.c" \
+    || { echo "FAIL: build greet lib dwarf4"; exit 1; }
+gcc -gdwarf-4 -g -O0 -o "$TMP/greetmain4" "$TMP/greetmain.c" -L"$TMP" -lgreet4 \
+    -Wl,-rpath,"$TMP" || { echo "FAIL: build greet main dwarf4"; exit 1; }
+
+"$ROOT/symtrace" -r greet -- "$TMP/greetmain4" > "$TMP/greet4.out" 2>&1
+if grep -q 'prototype from debug info: greet(char\*, int)' "$TMP/greet4.out" \
+   && grep -q 'greet("world", 1) = ' "$TMP/greet4.out"; then
+    echo "ok: DWARF 4 prototype (gcc 10 default) decoded"
+else
+    echo "FAIL: DWARF 4 prototype"
+    cat "$TMP/greet4.out"
+    fail=1
+fi
+
 # ---------- symtrace (attach mode) ----------
 
 cat > "$TMP/victim.c" <<'EOF'
