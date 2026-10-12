@@ -79,8 +79,8 @@ Press Ctrl-C to stop tracing; the summary is printed:
 ```
 $ symtrace 12345 fopen
 symtrace: tracing 'fopen' in pid 12345 (1 GOT slot) - press Ctrl-C to stop
-fopen("/etc/hostname", "r")
-fopen("/var/log/syslog", "a")
+fopen("/etc/hostname", "r") = 0x56409c6ad2a0
+fopen("/var/log/syslog", "a") = 0x56409c6ad6f0
 ^C
 fopen: 2 calls intercepted
 ```
@@ -107,6 +107,21 @@ somefunc(rdi=0x1 rsi=0x7ffd0000 rdx=0x0 rcx=0x0 r8=0x0 r9=0x7f00...)
 ```
 
 Later versions will get prototypes from DWARF or user declarations.
+
+### Return value capture
+
+The return address pushed by the caller's `call` sits at `[rsp]` at the
+entry stop. symtrace replaces it with a second magic unmapped address,
+lets the real function run to completion, and catches the resulting
+SIGSEGV when it executes `ret`. At that stop `rax` (or `xmm0`) holds the
+return value; RIP is restored to the original return address so the
+target continues exactly as if nothing happened. Each in-flight call has
+its own magic return address on its own stack, so nested and concurrent
+calls are handled naturally; functions that never return (exit, longjmp)
+simply leave a harmless magic address on an abandoned stack.
+
+The return type comes from the prototype table: `malloc(64) = 0x56409c6ad2a0`,
+`strcmp("a","b") = -1`, `fopen("/x","r") = NULL` for a failure.
 
 ### How it works (GOT hijacking, no code injection)
 

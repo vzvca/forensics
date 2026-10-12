@@ -47,6 +47,9 @@
 #define MAX_SLOTS 4096
 #define MAGIC_BASE 0x700000000000ULL
 #define MAGIC_STRIDE 16
+#define MAGIC_RET_BASE 0x710000000000ULL
+#define MAX_PENDING 256
+#define ARGBUF_LEN 512
 
 struct module {
     char path[PATH_MAX];
@@ -58,6 +61,13 @@ struct slot {
     uint64_t orig;
 };
 
+struct pending_call {
+    bool used;
+    uint64_t magic_ret;
+    uint64_t real_retaddr;
+    char args[ARGBUF_LEN];
+};
+
 static struct module modules[MAX_MODULES];
 static int nmodules;
 static struct slot slots[MAX_SLOTS];
@@ -67,7 +77,8 @@ static uint64_t call_count;
 static volatile sig_atomic_t interrupted;
 static pid_t target_pid;
 static const char *traced_symbol;
-static const enum arg_type *proto_args;
+static const struct func_prototype *proto;
+static struct pending_call pending[MAX_PENDING];
 
 static bool read_mem(pid_t pid, uint64_t addr, void *buf, size_t len)
 {
@@ -127,22 +138,8 @@ static bool read_cstring(pid_t pid, uint64_t addr, char *buf, size_t bufsz)
     return true;
 }
 
-static void print_escaped(const char *s)
-{
-    putchar('"');
-    for (const char *p = s; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (c == '"' || c == '\\')
-            printf("\\%c", c);
-        else if (c >= 0x20 && c < 0x7f)
-            putchar(c);
-        else
-            printf("\\x%02x", c);
-    }
-    putchar('"');
-}
-
-static void print_call_args(pid_t pid, const struct user_regs_struct *regs)
+static void print_call_args(pid_t pid, const struct user_regs_struct *regs,
+                            char *out, size_t outsz)
 {
     uint64_t int_args[6] = {
         regs->rdi, regs->rsi, regs->rdx, regs->rcx, regs->r8, regs->r9
@@ -157,23 +154,38 @@ static void print_call_args(pid_t pid, const struct user_regs_struct *regs)
     int sse_idx = 0;
     int stack_idx = 0;
 
-    printf("%s(", traced_symbol);
-    if (!proto_args) {
-        printf("rdi=%#llx rsi=%#llx rdx=%#llx rcx=%#llx r8=%#llx r9=%#llx",
-               (unsigned long long)int_args[0], (unsigned long long)int_args[1],
-               (unsigned long long)int_args[2], (unsigned long long)int_args[3],
-               (unsigned long long)int_args[4], (unsigned long long)int_args[5]);
-        printf(")\n");
+    size_t pos = 0;
+    int n = snprintf(out + pos, outsz - pos, "%s(", traced_symbol);
+    if (n < 0 || (size_t)n >= outsz - pos)
+        return;
+    pos += (size_t)n;
+
+    if (!proto || proto->ret == RET_NONE) {
+    }
+    if (!proto) {
+        n = snprintf(out + pos, outsz - pos,
+                     "rdi=%#llx rsi=%#llx rdx=%#llx rcx=%#llx r8=%#llx r9=%#llx",
+                     (unsigned long long)int_args[0], (unsigned long long)int_args[1],
+                     (unsigned long long)int_args[2], (unsigned long long)int_args[3],
+                     (unsigned long long)int_args[4], (unsigned long long)int_args[5]);
+        if (n < 0 || (size_t)n >= outsz - pos)
+            return;
+        pos += (size_t)n;
+        snprintf(out + pos, outsz - pos, ")");
         return;
     }
 
     bool first = true;
-    for (int a = 0; proto_args[a] != TYPE_END; a++) {
-        if (!first)
-            printf(", ");
+    for (int a = 0; proto->args[a] != TYPE_END; a++) {
+        if (!first) {
+            n = snprintf(out + pos, outsz - pos, ", ");
+            if (n < 0 || (size_t)n >= outsz - pos)
+                return;
+            pos += (size_t)n;
+        }
         first = false;
 
-        enum arg_type t = proto_args[a];
+        enum arg_type t = proto->args[a];
         uint64_t v = 0;
         double d = 0;
         bool is_sse = false;
@@ -202,42 +214,65 @@ static void print_call_args(pid_t pid, const struct user_regs_struct *regs)
             int_idx++;
         }
 
+        char piece[96];
         switch (t) {
         case TYPE_INTEGER:
-            printf("%lld", (long long)(int64_t)v);
+            n = snprintf(piece, sizeof(piece), "%lld", (long long)(int64_t)v);
             break;
         case TYPE_UNSIGNED:
-            printf("%lu", (unsigned long)v);
+            n = snprintf(piece, sizeof(piece), "%lu", (unsigned long)v);
             break;
         case TYPE_CHAR:
-            printf("'%c'", (char)v);
+            n = snprintf(piece, sizeof(piece), "'%c'", (char)v);
             break;
         case TYPE_POINTER:
-            printf("%#lx", (unsigned long)v);
+            n = snprintf(piece, sizeof(piece), "%#lx", (unsigned long)v);
             break;
         case TYPE_STRING: {
             char buf[65];
-            if (read_cstring(pid, v, buf, sizeof(buf)))
-                print_escaped(buf);
-            else if (v == 0)
-                printf("NULL");
-            else
-                printf("%#lx", (unsigned long)v);
+            piece[0] = '\0';
+            if (read_cstring(pid, v, buf, sizeof(buf))) {
+                size_t w = 0;
+                w += (size_t)snprintf(piece, sizeof(piece), "\"");
+                for (const char *p = buf; *p && w + 8 < sizeof(piece); p++) {
+                    unsigned char c = (unsigned char)*p;
+                    if (c == '"' || c == '\\') {
+                        w += (size_t)snprintf(piece + w, sizeof(piece) - w, "\\%c", c);
+                    } else if (c >= 0x20 && c < 0x7f) {
+                        piece[w++] = (char)c;
+                        piece[w] = '\0';
+                    } else {
+                        w += (size_t)snprintf(piece + w, sizeof(piece) - w, "\\x%02x", c);
+                    }
+                }
+                snprintf(piece + w, sizeof(piece) - w, "\"");
+            } else if (v == 0) {
+                snprintf(piece, sizeof(piece), "NULL");
+            } else {
+                snprintf(piece, sizeof(piece), "%#lx", (unsigned long)v);
+            }
+            n = (int)strlen(piece);
             break;
         }
         case TYPE_DOUBLE:
         case TYPE_FLOAT:
             if (is_sse)
-                printf("%g", d);
+                n = snprintf(piece, sizeof(piece), "%g", d);
             else
-                printf("<?>");
+                n = snprintf(piece, sizeof(piece), "<?>");
             break;
         default:
-            printf("<?>");
+            n = snprintf(piece, sizeof(piece), "<?>");
             break;
         }
+        if (n < 0)
+            return;
+        if ((size_t)n >= outsz - pos)
+            return;
+        memcpy(out + pos, piece, (size_t)n + 1);
+        pos += (size_t)n;
     }
-    printf(")\n");
+    snprintf(out + pos, outsz - pos, ")");
 }
 
 static void die(const char *fmt, ...)
@@ -440,6 +475,162 @@ static void restore_and_detach(pid_t pid)
     ptrace(PTRACE_DETACH, pid, NULL, NULL);
 }
 
+static struct pending_call *pending_alloc(void)
+{
+    for (int i = 0; i < MAX_PENDING; i++)
+        if (!pending[i].used) {
+            memset(&pending[i], 0, sizeof(pending[i]));
+            pending[i].used = true;
+            return &pending[i];
+        }
+    return NULL;
+}
+
+static struct pending_call *pending_find(uint64_t magic_ret)
+{
+    for (int i = 0; i < MAX_PENDING; i++)
+        if (pending[i].used && pending[i].magic_ret == magic_ret)
+            return &pending[i];
+    return NULL;
+}
+
+static void handle_call_stop(struct user_regs_struct *regs)
+{
+    call_count++;
+
+    struct pending_call *pc = pending_alloc();
+    if (!pc) {
+        char tmp[ARGBUF_LEN];
+        print_call_args(target_pid, regs, tmp, sizeof(tmp));
+        printf("%s\n", tmp);
+        fflush(stdout);
+        regs->rip = real_addr;
+        ptrace(PTRACE_SETREGS, target_pid, NULL, regs);
+        ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+        return;
+    }
+
+    print_call_args(target_pid, regs, pc->args, sizeof(pc->args));
+
+    uint64_t retaddr = peek(target_pid, regs->rsp);
+    if (retaddr == UINT64_MAX) {
+        printf("%s\n", pc->args);
+        fflush(stdout);
+        pc->used = false;
+        regs->rip = real_addr;
+        ptrace(PTRACE_SETREGS, target_pid, NULL, regs);
+        ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+        return;
+    }
+
+    int idx = -1;
+    for (int i = 0; i < MAX_PENDING; i++)
+        if (&pending[i] == pc) {
+            idx = i;
+            break;
+        }
+    pc->magic_ret = MAGIC_RET_BASE + (uint64_t)idx * MAGIC_STRIDE;
+    pc->real_retaddr = retaddr;
+
+    if (poke(target_pid, regs->rsp, pc->magic_ret) < 0) {
+        printf("%s\n", pc->args);
+        fflush(stdout);
+        pc->used = false;
+        regs->rip = real_addr;
+        ptrace(PTRACE_SETREGS, target_pid, NULL, regs);
+        ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+        return;
+    }
+
+    regs->rip = real_addr;
+    ptrace(PTRACE_SETREGS, target_pid, NULL, regs);
+    ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+}
+
+static void handle_return_stop(struct user_regs_struct *regs)
+{
+    struct pending_call *pc = pending_find(regs->rip);
+    if (!pc) {
+        ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+        return;
+    }
+
+    char retbuf[96];
+    unsigned long long rax = regs->rax;
+
+    bool have_ret = proto && proto->ret != RET_NONE;
+    if (have_ret) {
+        switch (proto->ret) {
+        case RET_INT:
+            snprintf(retbuf, sizeof(retbuf), " = %lld", (long long)(int64_t)rax);
+            break;
+        case RET_UNSIGNED:
+            snprintf(retbuf, sizeof(retbuf), " = %lu", (unsigned long)rax);
+            break;
+        case RET_POINTER:
+            if (rax == 0)
+                snprintf(retbuf, sizeof(retbuf), " = NULL");
+            else
+                snprintf(retbuf, sizeof(retbuf), " = %#lx", (unsigned long)rax);
+            break;
+        case RET_STRING: {
+            char buf[65];
+            if (rax == 0) {
+                snprintf(retbuf, sizeof(retbuf), " = NULL");
+            } else if (read_cstring(target_pid, rax, buf, sizeof(buf))) {
+                size_t w = 0;
+                w += (size_t)snprintf(retbuf, sizeof(retbuf), " = \"");
+                for (const char *p = buf; *p && w + 8 < sizeof(retbuf); p++) {
+                    unsigned char c = (unsigned char)*p;
+                    if (c == '"' || c == '\\')
+                        w += (size_t)snprintf(retbuf + w, sizeof(retbuf) - w, "\\%c", c);
+                    else if (c >= 0x20 && c < 0x7f) {
+                        retbuf[w++] = (char)c;
+                        retbuf[w] = '\0';
+                    } else
+                        w += (size_t)snprintf(retbuf + w, sizeof(retbuf) - w, "\\x%02x", c);
+                }
+                snprintf(retbuf + w, sizeof(retbuf) - w, "\"");
+            } else {
+                snprintf(retbuf, sizeof(retbuf), " = %#lx", (unsigned long)rax);
+            }
+            break;
+        }
+        case RET_DOUBLE:
+        case RET_FLOAT: {
+            struct user_fpregs_struct fp;
+            double d = 0;
+            if (ptrace(PTRACE_GETFPREGS, target_pid, NULL, &fp) == 0) {
+                unsigned long long raw;
+                memcpy(&raw, fp.xmm_space, sizeof(raw));
+                if (proto->ret == RET_DOUBLE)
+                    memcpy(&d, &raw, sizeof(d));
+                else {
+                    float f;
+                    memcpy(&f, &raw, sizeof(f));
+                    d = (double)f;
+                }
+            }
+            snprintf(retbuf, sizeof(retbuf), " = %g", d);
+            break;
+        }
+        default:
+            retbuf[0] = '\0';
+            break;
+        }
+    } else {
+        retbuf[0] = '\0';
+    }
+
+    printf("%s%s\n", pc->args, retbuf);
+    fflush(stdout);
+
+    pc->used = false;
+    regs->rip = pc->real_retaddr;
+    ptrace(PTRACE_SETREGS, target_pid, NULL, regs);
+    ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 3) {
@@ -452,7 +643,7 @@ int main(int argc, char **argv)
     target_pid = (pid_t)atoi(argv[1]);
     const char *symbol = argv[2];
     traced_symbol = symbol;
-    proto_args = proto_lookup(symbol);
+    proto = proto_lookup(symbol);
     if (target_pid <= 0)
         die("symtrace: invalid pid '%s'", argv[1]);
 
@@ -545,12 +736,12 @@ int main(int argc, char **argv)
                     is_magic = true;
                 }
                 if (is_magic) {
-                    call_count++;
-                    print_call_args(target_pid, &regs);
-                    fflush(stdout);
-                    regs.rip = real_addr;
-                    ptrace(PTRACE_SETREGS, target_pid, NULL, &regs);
-                    ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+                    handle_call_stop(&regs);
+                    continue;
+                }
+                if (regs.rip >= MAGIC_RET_BASE &&
+                    regs.rip < MAGIC_RET_BASE + (uint64_t)MAX_PENDING * MAGIC_STRIDE) {
+                    handle_return_stop(&regs);
                     continue;
                 }
             }

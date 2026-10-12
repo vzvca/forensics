@@ -153,10 +153,10 @@ wait "$VICTIM_PID" 2>/dev/null
 VICTIM_PID=""
 
 count="$(sed -n 's/^fopen: \([0-9]*\) call.*$/\1/p' "$TMP/trace.out" | tr -d '\r')"
-if grep -q 'fopen("/etc/hostname", "r")' "$TMP/trace.out"; then
-    echo "ok: symtrace decoded fopen arguments"
+if grep -q 'fopen("/etc/hostname", "r") = ' "$TMP/trace.out"; then
+    echo "ok: symtrace decoded fopen arguments and return value"
 else
-    echo "FAIL: symtrace did not decode fopen arguments"
+    echo "FAIL: symtrace did not decode fopen arguments and return value"
     cat "$TMP/trace.out"
     fail=1
 fi
