@@ -28,6 +28,7 @@
 #include "elfparse.h"
 #include "prototypes.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -467,12 +468,61 @@ static bool range_mapped(pid_t pid, uint64_t addr)
     return mapped;
 }
 
+#define MAX_THREADS 256
+static pid_t threads[MAX_THREADS];
+static int nthreads;
+
 static void restore_and_detach(pid_t pid)
 {
+    (void)pid;
     for (int i = 0; i < nslots; i++)
         if (slots[i].orig)
-            poke(pid, slots[i].addr, slots[i].orig);
-    ptrace(PTRACE_DETACH, pid, NULL, NULL);
+            poke(target_pid, slots[i].addr, slots[i].orig);
+    for (int t = 0; t < nthreads; t++)
+        ptrace(PTRACE_DETACH, threads[t], NULL, NULL);
+}
+
+static void attach_all_threads(pid_t pid)
+{
+    char taskdir[64];
+    snprintf(taskdir, sizeof(taskdir), "/proc/%d/task", pid);
+    DIR *d = opendir(taskdir);
+    if (!d)
+        die("symtrace: cannot open %s: %s", taskdir, strerror(errno));
+    struct dirent *ent;
+    nthreads = 0;
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] < '0' || ent->d_name[0] > '9')
+            continue;
+        pid_t tid = (pid_t)atoi(ent->d_name);
+        if (nthreads >= MAX_THREADS)
+            break;
+        if (ptrace(PTRACE_ATTACH, tid, NULL, NULL) < 0) {
+            fprintf(stderr, "symtrace: cannot attach to thread %d: %s\n",
+                    tid, strerror(errno));
+            continue;
+        }
+        threads[nthreads++] = tid;
+    }
+    closedir(d);
+    if (nthreads == 0)
+        die("symtrace: could not attach to any thread of %d", pid);
+    for (int t = 0; t < nthreads; t++) {
+        int status;
+        pid_t r;
+        do {
+            r = waitpid(threads[t], &status, __WALL);
+        } while (r < 0 && errno == EINTR);
+        if (r != threads[t]) {
+            fprintf(stderr, "symtrace: waitpid for thread %d failed\n",
+                    threads[t]);
+            continue;
+        }
+        if (ptrace(PTRACE_SETOPTIONS, threads[t], NULL,
+                   (void *)(long)PTRACE_O_TRACECLONE) < 0)
+            fprintf(stderr, "symtrace: cannot set options on thread %d: %s\n",
+                    threads[t], strerror(errno));
+    }
 }
 
 static struct pending_call *pending_alloc(void)
@@ -494,31 +544,31 @@ static struct pending_call *pending_find(uint64_t magic_ret)
     return NULL;
 }
 
-static void handle_call_stop(struct user_regs_struct *regs)
+static void handle_call_stop(pid_t tid, struct user_regs_struct *regs)
 {
     call_count++;
 
     struct pending_call *pc = pending_alloc();
     if (!pc) {
         char tmp[ARGBUF_LEN];
-        print_call_args(target_pid, regs, tmp, sizeof(tmp));
+        print_call_args(tid, regs, tmp, sizeof(tmp));
         printf("%s\n", tmp);
         fflush(stdout);
         regs->rip = real_addr;
-        ptrace(PTRACE_SETREGS, target_pid, NULL, regs);
-        ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+        ptrace(PTRACE_SETREGS, tid, NULL, regs);
+        ptrace(PTRACE_CONT, tid, NULL, NULL);
         return;
     }
 
-    print_call_args(target_pid, regs, pc->args, sizeof(pc->args));
+    print_call_args(tid, regs, pc->args, sizeof(pc->args));
 
-    uint64_t retaddr = peek(target_pid, regs->rsp);
+    uint64_t retaddr = peek(tid, regs->rsp);
     if (retaddr == UINT64_MAX) {
         printf("%s\n", pc->args);
         fflush(stdout);
         pc->used = false;
         regs->rip = real_addr;
-        ptrace(PTRACE_SETREGS, target_pid, NULL, regs);
+        ptrace(PTRACE_SETREGS, tid, NULL, regs);
         ptrace(PTRACE_CONT, target_pid, NULL, NULL);
         return;
     }
@@ -532,26 +582,26 @@ static void handle_call_stop(struct user_regs_struct *regs)
     pc->magic_ret = MAGIC_RET_BASE + (uint64_t)idx * MAGIC_STRIDE;
     pc->real_retaddr = retaddr;
 
-    if (poke(target_pid, regs->rsp, pc->magic_ret) < 0) {
+    if (poke(tid, regs->rsp, pc->magic_ret) < 0) {
         printf("%s\n", pc->args);
         fflush(stdout);
         pc->used = false;
         regs->rip = real_addr;
-        ptrace(PTRACE_SETREGS, target_pid, NULL, regs);
+        ptrace(PTRACE_SETREGS, tid, NULL, regs);
         ptrace(PTRACE_CONT, target_pid, NULL, NULL);
         return;
     }
 
     regs->rip = real_addr;
-    ptrace(PTRACE_SETREGS, target_pid, NULL, regs);
-    ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+    ptrace(PTRACE_SETREGS, tid, NULL, regs);
+    ptrace(PTRACE_CONT, tid, NULL, NULL);
 }
 
-static void handle_return_stop(struct user_regs_struct *regs)
+static void handle_return_stop(pid_t tid, struct user_regs_struct *regs)
 {
     struct pending_call *pc = pending_find(regs->rip);
     if (!pc) {
-        ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+        ptrace(PTRACE_CONT, tid, NULL, NULL);
         return;
     }
 
@@ -577,7 +627,7 @@ static void handle_return_stop(struct user_regs_struct *regs)
             char buf[65];
             if (rax == 0) {
                 snprintf(retbuf, sizeof(retbuf), " = NULL");
-            } else if (read_cstring(target_pid, rax, buf, sizeof(buf))) {
+            } else if (read_cstring(tid, rax, buf, sizeof(buf))) {
                 size_t w = 0;
                 w += (size_t)snprintf(retbuf, sizeof(retbuf), " = \"");
                 for (const char *p = buf; *p && w + 8 < sizeof(retbuf); p++) {
@@ -600,7 +650,7 @@ static void handle_return_stop(struct user_regs_struct *regs)
         case RET_FLOAT: {
             struct user_fpregs_struct fp;
             double d = 0;
-            if (ptrace(PTRACE_GETFPREGS, target_pid, NULL, &fp) == 0) {
+            if (ptrace(PTRACE_GETFPREGS, tid, NULL, &fp) == 0) {
                 unsigned long long raw;
                 memcpy(&raw, fp.xmm_space, sizeof(raw));
                 if (proto->ret == RET_DOUBLE)
@@ -627,8 +677,8 @@ static void handle_return_stop(struct user_regs_struct *regs)
 
     pc->used = false;
     regs->rip = pc->real_retaddr;
-    ptrace(PTRACE_SETREGS, target_pid, NULL, regs);
-    ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+    ptrace(PTRACE_SETREGS, tid, NULL, regs);
+    ptrace(PTRACE_CONT, tid, NULL, NULL);
 }
 
 int main(int argc, char **argv)
@@ -647,10 +697,7 @@ int main(int argc, char **argv)
     if (target_pid <= 0)
         die("symtrace: invalid pid '%s'", argv[1]);
 
-    if (ptrace(PTRACE_ATTACH, target_pid, NULL, NULL) < 0)
-        die("symtrace: cannot attach to %d: %s", target_pid, strerror(errno));
-    if (waitpid(target_pid, NULL, 0) < 0)
-        die("symtrace: waitpid: %s", strerror(errno));
+    attach_all_threads(target_pid);
 
     load_maps(target_pid);
 
@@ -709,7 +756,7 @@ int main(int argc, char **argv)
 
     int status;
     while (!interrupted) {
-        pid_t r = waitpid(target_pid, &status, __WALL);
+        pid_t r = waitpid(-1, &status, __WALL);
         if (r < 0) {
             if (errno == EINTR) {
                 if (interrupted)
@@ -719,41 +766,65 @@ int main(int argc, char **argv)
             break;
         }
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            interrupted = 1;
+            bool leader = (r == target_pid);
+            bool alive = false;
+            for (int t = 0; t < nthreads; t++)
+                if (threads[t] != r)
+                    alive = true;
+            if (leader || !alive)
+                interrupted = 1;
             continue;
         }
         if (!WIFSTOPPED(status))
             continue;
+        pid_t tid = r;
         int sig = WSTOPSIG(status);
+
+        if (status >> 16 == PTRACE_EVENT_CLONE) {
+            unsigned long newtid;
+            if (ptrace(PTRACE_GETEVENTMSG, tid, NULL, &newtid) == 0 &&
+                nthreads < MAX_THREADS && newtid != 0) {
+                threads[nthreads++] = (pid_t)newtid;
+            }
+            ptrace(PTRACE_CONT, tid, NULL, NULL);
+            continue;
+        }
+
+        if (sig == SIGSTOP) {
+            ptrace(PTRACE_CONT, tid, NULL, NULL);
+            continue;
+        }
+
         if (sig == SIGSEGV) {
             struct user_regs_struct regs;
-            if (ptrace(PTRACE_GETREGS, target_pid, NULL, &regs) == 0) {
-                uint64_t retaddr = regs.rax;
-                (void)retaddr;
-                bool is_magic = false;
-                if (regs.rip >= MAGIC_BASE &&
-                    regs.rip < MAGIC_BASE + (uint64_t)nslots * MAGIC_STRIDE) {
-                    is_magic = true;
-                }
+            if (ptrace(PTRACE_GETREGS, tid, NULL, &regs) == 0) {
+                bool is_magic =
+                    regs.rip >= MAGIC_BASE &&
+                    regs.rip < MAGIC_BASE + (uint64_t)nslots * MAGIC_STRIDE;
                 if (is_magic) {
-                    handle_call_stop(&regs);
+                    handle_call_stop(tid, &regs);
                     continue;
                 }
                 if (regs.rip >= MAGIC_RET_BASE &&
                     regs.rip < MAGIC_RET_BASE + (uint64_t)MAX_PENDING * MAGIC_STRIDE) {
-                    handle_return_stop(&regs);
+                    handle_return_stop(tid, &regs);
                     continue;
                 }
             }
-            ptrace(PTRACE_CONT, target_pid, NULL, (void *)(long)sig);
+            ptrace(PTRACE_CONT, tid, NULL, (void *)(long)sig);
             continue;
         }
-        ptrace(PTRACE_CONT, target_pid, NULL,
+        ptrace(PTRACE_CONT, tid, NULL,
                sig == SIGTRAP ? NULL : (void *)(long)sig);
     }
 
-    kill(target_pid, SIGSTOP);
-    waitpid(target_pid, NULL, __WALL);
+    for (int t = 0; t < nthreads; t++)
+        kill(threads[t], SIGSTOP);
+    for (int t = 0; t < nthreads; t++) {
+        int status;
+        if (waitpid(-1, &status, __WALL) < 0)
+            break;
+    }
     restore_and_detach(target_pid);
 
     printf("%s: %lu call%s intercepted\n", symbol,
