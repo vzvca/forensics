@@ -1,19 +1,17 @@
 #!/bin/sh
-# Test suite for symfind.
+# Test suite for symfind and symtrace.
 #
-# Builds:
-#   - a shared library exporting `dep_only_func` and `dep_wild_func_1`
-#     (defined only there)
-#   - an executable linked against it and exporting `local_only_func`
-#     via -rdynamic (defined in the executable itself)
+# symfind: builds a shared library and an -rdynamic executable linking it,
+# then checks exact, glob and regex matching, plus the not-found case.
 #
-# Then checks exact, glob and regex matching, plus the not-found case.
+# symtrace: builds a victim that calls fopen() in a loop, attaches to it
+# by PID and checks that the call count matches.
 
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"; [ -n "${VICTIM_PID:-}" ] && kill "$VICTIM_PID" 2>/dev/null' EXIT
 
 fail=0
 
@@ -54,7 +52,8 @@ check_rc()
 
 make -C "$ROOT" >/dev/null || { echo "FAIL: build"; exit 1; }
 
-# Build the test fixtures.
+# ---------- symfind ----------
+
 cat > "$TMP/dep.c" <<'EOF'
 int dep_only_func(void)
 {
@@ -89,23 +88,19 @@ EOF
 gcc -shared -fPIC -o "$TMP/libtestdep.so" "$TMP/dep.c" || { echo "FAIL: build fixture"; exit 1; }
 gcc -o "$TMP/testbin" "$TMP/main.c" -L"$TMP" -ltestdep -Wl,-rpath,"$TMP" -rdynamic || { echo "FAIL: build fixture"; exit 1; }
 
-# Case 1: symbol defined directly in the analyzed binary (not in a dependency).
 check "exact: symbol defined in the binary itself" \
      "$TMP/testbin: local_only_func" \
      "$TMP/testbin" local_only_func
 
-# Case 2: symbol defined in a direct dependency.
 check "exact: symbol defined in a dependency" \
      "$TMP/libtestdep.so: dep_only_func" \
      "$TMP/testbin" dep_only_func
 
-# Case 3: glob matching several symbols in a dependency.
 check "glob: multiple symbols in a dependency" \
      "$TMP/libtestdep.so: dep_wild_func_1
 $TMP/libtestdep.so: dep_wild_func_2" \
      -g "$TMP/testbin" 'dep_wild_*'
 
-# Case 4: regex matching symbols across the binary and its dependencies.
 check "regex: symbol in the binary itself" \
      "$TMP/testbin: local_only_func" \
      -r "$TMP/testbin" '^local_[a-z_]+$'
@@ -116,11 +111,57 @@ $TMP/libtestdep.so: dep_wild_func_1
 $TMP/libtestdep.so: dep_wild_func_2" \
      -r "$TMP/testbin" '^dep_(only|wild)_'
 
-# Case 5: a symbol that exists nowhere in the closure.
 check_rc "missing symbol reported not found" 1 "$TMP/testbin" symbol_that_exists_nowhere
 
-# Case 6: invalid regex is a usage error.
 check_rc "invalid regex reported" 2 -r "$TMP/testbin" '['
+
+# ---------- symtrace ----------
+
+cat > "$TMP/victim.c" <<'EOF'
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void)
+{
+    /* one call before the tracer attaches */
+    FILE *f = fopen("/etc/hostname", "r");
+    if (f)
+        fclose(f);
+    for (int i = 0; i < 10; i++) {
+        sleep(1);
+        f = fopen("/etc/hostname", "r");
+        if (f)
+            fclose(f);
+    }
+    return 0;
+}
+EOF
+
+gcc -O0 -o "$TMP/victim" "$TMP/victim.c" || { echo "FAIL: build victim"; exit 1; }
+
+"$TMP/victim" >/dev/null 2>&1 &
+VICTIM_PID=$!
+sleep 1
+
+"$ROOT/symtrace" "$VICTIM_PID" fopen > "$TMP/trace.out" 2>&1 &
+TRACE_PID=$!
+sleep 3
+kill -INT "$TRACE_PID"
+wait "$TRACE_PID"
+kill "$VICTIM_PID" 2>/dev/null
+wait "$VICTIM_PID" 2>/dev/null
+VICTIM_PID=""
+
+count="$(sed -n 's/^fopen: \([0-9]*\) call.*$/\1/p' "$TMP/trace.out" | tr -d '\r')"
+# victim calls fopen once per second after the first; tracer attached at ~1s,
+# traced for ~3s so expect 2-3 calls. Accept 1..4 to stay robust.
+if [ -n "$count" ] && [ "$count" -ge 1 ] && [ "$count" -le 4 ]; then
+    echo "ok: symtrace counted $count fopen calls"
+else
+    echo "FAIL: symtrace call count (got '${count:-none}', expected 1..4)"
+    cat "$TMP/trace.out"
+    fail=1
+fi
 
 if [ $fail -eq 0 ]; then
     echo "all tests passed"

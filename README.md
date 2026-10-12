@@ -10,31 +10,6 @@ symbol. It reads ELF files directly from disk (mmap + manual parsing of the
 program headers, `.dynamic`, `.dynsym` and `.dynstr`), with no external
 dependency beyond libc.
 
-```
-$ symfind /bin/ls printf
-/lib/x86_64-linux-gnu/libc.so.6
-
-$ symfind /bin/grep pcre2_compile_8
-/lib/x86_64-linux-gnu/libpcre2-8.so.0
-```
-
-### Build
-
-```
-make
-```
-
-### Test
-
-```
-make test
-```
-
-The suite builds fixtures on the fly (a shared library and an executable
-that both export symbols) and checks the three cases: symbol defined in the
-analyzed binary itself, symbol defined in a dependency, and symbol absent
-from the whole closure.
-
 ### Usage
 
 ```
@@ -70,13 +45,12 @@ $ symfind -r /bin/grep '^pc?re2_compile'
 3. Parses `PT_DYNAMIC` in two passes (first collect `DT_STRTAB`/`DT_STRSZ`,
    then read `DT_NEEDED`, `DT_RPATH`, `DT_RUNPATH`).
 4. Scans `.dynsym` for a **defined** symbol (non-null `st_value`,
-   `st_shndx != SHN_UNDEF`) matching the requested name.
+   `st_shndx != SHN_UNDEF`) matching the pattern.
 5. Resolves each `DT_NEEDED` entry with the same search order as the dynamic
    loader: `DT_RUNPATH`, `LD_LIBRARY_PATH`, `DT_RPATH`, then the default
-   system directories (`/lib`, `/usr/lib`, multi-arch directories, ...).
-   `$ORIGIN`, `$LIB` and `$PLATFORM` tokens in RPATH/RUNPATH are expanded.
+   system directories. `$ORIGIN`, `$LIB` and `$PLATFORM` tokens are expanded.
 6. Recurses into every dependency (already-seen libraries are skipped,
-   depth-capped) until a definition is found.
+   depth-capped) and lists all matches.
 
 ### Limitations
 
@@ -86,3 +60,72 @@ $ symfind -r /bin/grep '^pc?re2_compile'
   like `dlsym` without a version constraint.
 - `ld.so.cache` is not parsed; the default search path is a static list of
   common directories.
+
+## symtrace
+
+`symtrace` attaches to a **running process** identified by its PID and
+counts every call to a function identified by its symbol name. The library
+that actually provides the function is discovered by reusing the same
+ELF-parsing core as `symfind`.
+
+### Usage
+
+```
+symtrace <pid> <symbol>
+```
+
+Press Ctrl-C to stop tracing; the summary is printed:
+
+```
+$ symtrace 12345 fopen
+symtrace: tracing 'fopen' in pid 12345 (1 GOT slot) - press Ctrl-C to stop
+^C
+fopen: 3 calls intercepted
+```
+
+### How it works (GOT hijacking, no code injection)
+
+1. `PTRACE_ATTACH` the target, then enumerate its loaded modules from
+   `/proc/<pid>/maps`.
+2. Parse every module on disk with the shared ELF core and collect all
+   dynamic relocations (`R_X86_64_JUMP_SLOT`, `R_X86_64_GLOB_DAT`) that
+   reference `<symbol>` — each relocation gives the live address of one
+   GOT slot in the target.
+3. Resolve the real address of the function (defining module's symbol
+   table, or an already-resolved GOT slot).
+4. Overwrite each GOT slot with a distinct **magic unmapped address** using
+   `PTRACE_POKEDATA`. Since ptrace writes bypass page permissions, Full
+   RELRO binaries are handled without `mprotect` tricks.
+5. Resume the process. Every call to the function now jumps to the magic
+   address and raises `SIGSEGV`; the tracer catches the stop, counts it,
+   rewrites RIP to the real function address and resumes. The call proceeds
+   normally — the target never crashes and its behaviour is unchanged.
+6. On exit, the original GOT values are restored, then the target is
+   detached.
+
+### Limitations
+
+- x86_64 targets only.
+- Only calls that cross a PLT/GOT are seen: calls made *internally* within
+  the defining library (e.g. libc calling its own `fopen` internally) do not
+  go through a GOT slot and are not counted.
+- Every counted call costs a ptrace stop/start round-trip, so traced
+  programs run slower (fine for debugging, not for hot loops).
+- Each module in the process has its own GOT; slots are patched in every
+  mapped module that imports the symbol.
+
+## Build / Test
+
+```
+make        # builds symfind and symtrace
+make test   # builds fixtures and runs the test suite
+make install
+```
+
+The test suite covers: symbol defined in the analyzed binary itself, symbol
+defined in a dependency, glob and regex patterns, missing symbol, invalid
+regex, and an end-to-end symtrace run against a live victim process.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
