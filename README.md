@@ -38,13 +38,29 @@ from the whole closure.
 ### Usage
 
 ```
-symfind <elf-file> <symbol>
+symfind [-g|-r] <elf-file> <pattern>
 ```
 
-- exit code 0: the symbol was found, its defining library is printed on stdout
-- exit code 1: the symbol is not defined by the file or any of its
-  dependencies
-- exit code 2: usage error
+By default `<pattern>` is matched literally. With `-g` it is treated as a
+shell glob (fnmatch), with `-r` as an extended regular expression
+(POSIX ERE). Every defined symbol matching the pattern is printed as
+`<library>: <symbol>`, across the file and all its transitive dependencies.
+
+```
+$ symfind /bin/ls printf
+/lib/x86_64-linux-gnu/libc.so.6: printf
+
+$ symfind -g /bin/ls 'printf_*'
+/lib/x86_64-linux-gnu/libc.so.6: printf_size
+/lib/x86_64-linux-gnu/libc.so.6: printf_size_info
+
+$ symfind -r /bin/grep '^pc?re2_compile'
+/lib/x86_64-linux-gnu/libpcre2-8.so.0: pcre2_compile_8
+```
+
+- exit code 0: at least one symbol matched
+- exit code 1: no symbol matched in the file or any of its dependencies
+- exit code 2: usage error, invalid regex, or unreadable file
 
 ### How it works
 

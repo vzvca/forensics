@@ -12,8 +12,11 @@
 
 #include <dirent.h>
 #include <elf.h>
+#include <fnmatch.h>
+#include <regex.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -30,6 +33,18 @@
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
+
+enum match_mode {
+    MATCH_EXACT,
+    MATCH_GLOB,
+    MATCH_REGEX,
+};
+
+struct matcher {
+    enum match_mode mode;
+    const char *pattern;
+    regex_t regex;
+};
 static const char *dirname_of_self(void);
 static const char *platform_string(void);
 
@@ -306,14 +321,37 @@ static bool sym_is_defined(const struct elf_file *e, size_t idx)
     }
 }
 
-static bool find_symbol(const struct elf_file *e, const char *name)
+static bool matcher_init(struct matcher *m, enum match_mode mode, const char *pattern)
 {
-    for (size_t i = 0; i < e->symcount; i++) {
-        if (!sym_is_defined(e, i))
-            continue;
-        const char *n = sym_name(e, i);
-        if (n && strcmp(n, name) == 0)
-            return true;
+    m->mode = mode;
+    m->pattern = pattern;
+    if (mode == MATCH_REGEX) {
+        int rc = regcomp(&m->regex, pattern, REG_EXTENDED | REG_NOSUB);
+        if (rc != 0) {
+            char err[256];
+            regerror(rc, &m->regex, err, sizeof(err));
+            fprintf(stderr, "symfind: invalid regex '%s': %s\n", pattern, err);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void matcher_free(struct matcher *m)
+{
+    if (m->mode == MATCH_REGEX)
+        regfree(&m->regex);
+}
+
+static bool matcher_match(const struct matcher *m, const char *name)
+{
+    switch (m->mode) {
+    case MATCH_EXACT:
+        return strcmp(name, m->pattern) == 0;
+    case MATCH_GLOB:
+        return fnmatch(m->pattern, name, 0) == 0;
+    case MATCH_REGEX:
+        return regexec(&m->regex, name, 0, NULL, 0) == 0;
     }
     return false;
 }
@@ -471,7 +509,12 @@ static bool resolve_lib(const struct elf_file *parent, const char *name,
     return false;
 }
 
-static bool walk(const char *path, const char *symbol,
+static void print_match(const char *libpath, const char *symname)
+{
+    printf("%s: %s\n", libpath, symname);
+}
+
+static bool walk(const char *path, const struct matcher *m,
                  const char **visited, int *nvisited, int depth)
 {
     struct elf_file e;
@@ -479,14 +522,18 @@ static bool walk(const char *path, const char *symbol,
         fprintf(stderr, "symfind: cannot open or parse %s\n", path);
         return false;
     }
-    if (find_symbol(&e, symbol)) {
-        printf("%s\n", e.path);
-        elf_unload(&e);
-        return true;
-    }
     bool found = false;
+    for (size_t i = 0; i < e.symcount; i++) {
+        if (!sym_is_defined(&e, i))
+            continue;
+        const char *n = sym_name(&e, i);
+        if (n && matcher_match(m, n)) {
+            print_match(e.path, n);
+            found = true;
+        }
+    }
     if (depth < 32) {
-        for (int i = 0; i < e.needed_count && !found; i++) {
+        for (int i = 0; i < e.needed_count; i++) {
             const char *dep = e.needed[i];
             if (!dep || in_list(visited, *nvisited, dep))
                 continue;
@@ -497,30 +544,67 @@ static bool walk(const char *path, const char *symbol,
                 continue;
             }
             visited[(*nvisited)++] = xstrdup(dep);
-            found = walk(libpath, symbol, visited, nvisited, depth + 1);
+            if (walk(libpath, m, visited, nvisited, depth + 1))
+                found = true;
         }
     }
     elf_unload(&e);
     return found;
 }
 
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "Usage: %s [options] <elf-file> <pattern>\n"
+        "\n"
+        "Options:\n"
+        "  -g  treat <pattern> as a shell glob (fnmatch, e.g. 'pri*')\n"
+        "  -r  treat <pattern> as an extended regular expression (POSIX ERE)\n"
+        "\n"
+        "By default <pattern> is matched literally. Matches are printed as\n"
+        "'<library>: <symbol>' for every defined symbol in the file and its\n"
+        "transitive dependencies. Exit code is 0 if at least one symbol\n"
+        "matched, 1 otherwise, 2 on usage or file error.\n",
+        prog);
+}
+
 int main(int argc, char **argv)
 {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <elf-file> <symbol>\n", argv[0]);
+    enum match_mode mode = MATCH_EXACT;
+    int opt;
+    while ((opt = getopt(argc, argv, "gr")) != -1) {
+        switch (opt) {
+        case 'g': mode = MATCH_GLOB; break;
+        case 'r': mode = MATCH_REGEX; break;
+        default:
+            usage(argv[0]);
+            return 2;
+        }
+    }
+    if (argc - optind != 2) {
+        usage(argv[0]);
         return 2;
     }
+    const char *file = argv[optind];
+    const char *pattern = argv[optind + 1];
+
     struct stat st;
-    if (stat(argv[1], &st) < 0)
-        die("symfind: %s: %s", argv[1], strerror(errno));
+    if (stat(file, &st) < 0)
+        die("symfind: %s: %s", file, strerror(errno));
+
+    struct matcher m;
+    if (!matcher_init(&m, mode, pattern))
+        return 2;
 
     const char *visited[MAX_DEPS];
     int nvisited = 0;
-    visited[nvisited++] = xstrdup(argv[1]);
+    visited[nvisited++] = xstrdup(file);
 
-    if (!walk(argv[1], argv[2], visited, &nvisited, 0)) {
-        printf("symbol %s not found in %s or its dependencies\n",
-               argv[2], argv[1]);
+    bool found = walk(file, &m, visited, &nvisited, 0);
+    matcher_free(&m);
+    if (!found) {
+        printf("no symbol matching '%s' found in %s or its dependencies\n",
+               pattern, file);
         return 1;
     }
     return 0;
