@@ -75,9 +75,14 @@ automatically when the program exits.
 ### Usage
 
 ```
-symtrace <pid> <symbol>                    # attach to a running process
-symtrace -r <symbol> -- <program> [args]   # start a program under tracing
+symtrace <pid> <symbol[,symbol...]>                    # attach to a running process
+symtrace -r <symbol[,symbol...]> -- <program> [args]   # start a program under tracing
 ```
+
+Multiple symbols (comma-separated, up to 8) are traced in one run;
+each GOT slot carries its own symbol, prototype (hard-coded table or
+DWARF, possibly none) and call counter, and the summary prints one
+line per symbol.
 
 Press Ctrl-C to stop tracing; the summary is printed:
 

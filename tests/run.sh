@@ -212,6 +212,41 @@ else
     fail=1
 fi
 
+
+# ---------- symtrace (multiple symbols) ----------
+
+cat > "$TMP/multi.c" <<'MULTIEOF'
+#include <stdio.h>
+#include <stdlib.h>
+int main(void)
+{
+    for (int i = 0; i < 2; i++) {
+        void *p = malloc(32);
+        FILE *f = fopen("/etc/hostname", "r");
+        if (f)
+            fclose(f);
+        free(p);
+    }
+    return 0;
+}
+MULTIEOF
+
+gcc -O0 -o "$TMP/multi" "$TMP/multi.c" || { echo "FAIL: build multi"; exit 1; }
+
+"$ROOT/symtrace" -r fopen,malloc -- "$TMP/multi" > "$TMP/multi.out" 2>&1
+rc=$?
+if [ "$rc" = "0" ] && grep -q 'also tracing' "$TMP/multi.out" \
+   && grep -q 'fopen: 2 calls intercepted' "$TMP/multi.out" \
+   && grep -q 'malloc: [2-9] calls intercepted' "$TMP/multi.out" \
+   && grep -q 'fopen("/etc/hostname", "r") = ' "$TMP/multi.out" \
+   && grep -q 'malloc(32) = ' "$TMP/multi.out"; then
+    echo "ok: symtrace traced multiple symbols in one run"
+else
+    echo "FAIL: multi-symbol tracing (rc=$rc)"
+    cat "$TMP/multi.out"
+    fail=1
+fi
+
 # ---------- symtrace (attach mode) ----------
 
 cat > "$TMP/victim.c" <<'EOF'

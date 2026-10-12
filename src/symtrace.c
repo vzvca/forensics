@@ -61,10 +61,17 @@ struct module {
 struct slot {
     uint64_t addr;
     uint64_t orig;
+    const char *symbol;
+    uint64_t real_addr;
+    const struct func_prototype *proto;   /* hard-coded table */
+    struct func_prototype dw;             /* from DWARF, dw.name==NULL if none */
+    char pretty[256];
+    uint64_t calls;
 };
 
 struct pending_call {
     bool used;
+    int slot_idx;
     uint64_t magic_ret;
     uint64_t real_retaddr;
     char args[ARGBUF_LEN];
@@ -74,25 +81,34 @@ static struct module modules[MAX_MODULES];
 static int nmodules;
 static struct slot slots[MAX_SLOTS];
 static int nslots;
-static uint64_t real_addr;
-static struct func_prototype dw_proto;
-static char dw_pretty[256];
+static char symbol_buf[64][8];
+static const char *symbols[8];
+static int nsymbols;
 
-static bool try_dwarf_proto(const char *elf_path, const char *symbol)
+static bool dwarf_into(struct func_prototype *out, char pretty[256],
+                       const char *elf_path, const char *symbol)
 {
     enum arg_type args[8];
     enum ret_type ret;
-    char pretty[256];
+    char prettybuf[256];
 
-    if (dwarf_func_prototype(elf_path, symbol, args, &ret, pretty)) {
-        memset(&dw_proto, 0, sizeof(dw_proto));
-        dw_proto.name = symbol;
-        dw_proto.ret = ret;
+    if (dwarf_func_prototype(elf_path, symbol, args, &ret, prettybuf)) {
+        memset(out, 0, sizeof(*out));
+        out->name = symbol;
+        out->ret = ret;
         for (int i = 0; i < 8; i++)
-            dw_proto.args[i] = args[i];
-        snprintf(dw_pretty, sizeof(dw_pretty), "%s", pretty);
+            out->args[i] = args[i];
+        snprintf(pretty, 256, "%s", prettybuf);
         return true;
     }
+    return false;
+}
+
+static bool try_dwarf_proto(struct func_prototype *out, char pretty[256],
+                            const char *elf_path, const char *symbol)
+{
+    if (dwarf_into(out, pretty, elf_path, symbol))
+        return true;
 
     uint32_t crc;
     char *link = dwarf_debuglink(elf_path, &crc);
@@ -112,13 +128,7 @@ static bool try_dwarf_proto(const char *elf_path, const char *symbol)
         char cand[PATH_MAX];
         snprintf(cand, sizeof(cand), suffixes[i], dir, link);
         if (access(cand, R_OK) == 0 &&
-            dwarf_func_prototype(cand, symbol, args, &ret, pretty)) {
-            memset(&dw_proto, 0, sizeof(dw_proto));
-            dw_proto.name = symbol;
-            dw_proto.ret = ret;
-            for (int j = 0; j < 8; j++)
-                dw_proto.args[j] = args[j];
-            snprintf(dw_pretty, sizeof(dw_pretty), "%s", pretty);
+            dwarf_into(out, pretty, cand, symbol)) {
             free(link);
             return true;
         }
@@ -127,11 +137,8 @@ static bool try_dwarf_proto(const char *elf_path, const char *symbol)
     return false;
 }
 
-static uint64_t call_count;
 static volatile sig_atomic_t interrupted;
 static pid_t target_pid;
-static const char *traced_symbol;
-static const struct func_prototype *proto;
 static struct pending_call pending[MAX_PENDING];
 
 static bool read_mem(pid_t pid, uint64_t addr, void *buf, size_t len)
@@ -193,6 +200,7 @@ static bool read_cstring(pid_t pid, uint64_t addr, char *buf, size_t bufsz)
 }
 
 static void print_call_args(pid_t pid, const struct user_regs_struct *regs,
+                            const char *name, const struct func_prototype *proto,
                             char *out, size_t outsz)
 {
     uint64_t int_args[6] = {
@@ -209,7 +217,7 @@ static void print_call_args(pid_t pid, const struct user_regs_struct *regs,
     int stack_idx = 0;
 
     size_t pos = 0;
-    int n = snprintf(out + pos, outsz - pos, "%s(", traced_symbol);
+    int n = snprintf(out + pos, outsz - pos, "%s(", name);
     if (n < 0 || (size_t)n >= outsz - pos)
         return;
     pos += (size_t)n;
@@ -430,8 +438,7 @@ static bool is_target_reloc_type(uint64_t type)
 #endif
 }
 
-static void find_got_slots(const struct elf_file *e, uint64_t base,
-                           const char *symbol)
+static void find_got_slots(const struct elf_file *e, uint64_t base)
 {
     if (!e->is64)
         return;
@@ -456,7 +463,15 @@ static void find_got_slots(const struct elf_file *e, uint64_t base,
             if (!is_target_reloc_type(type))
                 continue;
             const char *name = elf_sym_name(e, symidx);
-            if (!name || strcmp(name, symbol) != 0)
+            if (!name)
+                continue;
+            const char *matched = NULL;
+            for (int k = 0; k < nsymbols; k++)
+                if (strcmp(name, symbols[k]) == 0) {
+                    matched = symbols[k];
+                    break;
+                }
+            if (!matched)
                 continue;
             uint64_t slotaddr = base + r->r_offset;
             bool dup = false;
@@ -467,14 +482,17 @@ static void find_got_slots(const struct elf_file *e, uint64_t base,
                 }
             if (dup || nslots >= MAX_SLOTS)
                 continue;
+            memset(&slots[nslots], 0, sizeof(slots[nslots]));
             slots[nslots].addr = slotaddr;
-            slots[nslots].orig = 0;
+            slots[nslots].symbol = matched;
             nslots++;
         }
     }
 }
 
 static char defining_module[PATH_MAX];
+
+static bool setup_slots(pid_t pid, bool fatal);
 
 static uint64_t resolve_real_addr(pid_t pid, const char *symbol)
 {
@@ -610,32 +628,35 @@ static struct pending_call *pending_find(uint64_t magic_ret)
     return NULL;
 }
 
-static void handle_call_stop(pid_t tid, struct user_regs_struct *regs)
+static void handle_call_stop(pid_t tid, struct user_regs_struct *regs, int sidx)
 {
-    call_count++;
+    struct slot *sl = &slots[sidx];
+
+    sl->calls++;
 
     struct pending_call *pc = pending_alloc();
     if (!pc) {
         char tmp[ARGBUF_LEN];
-        print_call_args(tid, regs, tmp, sizeof(tmp));
+        print_call_args(tid, regs, sl->symbol, sl->proto, tmp, sizeof(tmp));
         printf("%s\n", tmp);
         fflush(stdout);
-        regs->rip = real_addr;
+        regs->rip = sl->real_addr;
         ptrace(PTRACE_SETREGS, tid, NULL, regs);
         ptrace(PTRACE_CONT, tid, NULL, NULL);
         return;
     }
+    pc->slot_idx = sidx;
 
-    print_call_args(tid, regs, pc->args, sizeof(pc->args));
+    print_call_args(tid, regs, sl->symbol, sl->proto, pc->args, sizeof(pc->args));
 
     uint64_t retaddr = peek(tid, regs->rsp);
     if (retaddr == UINT64_MAX) {
         printf("%s\n", pc->args);
         fflush(stdout);
         pc->used = false;
-        regs->rip = real_addr;
+        regs->rip = sl->real_addr;
         ptrace(PTRACE_SETREGS, tid, NULL, regs);
-        ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+        ptrace(PTRACE_CONT, tid, NULL, NULL);
         return;
     }
 
@@ -652,13 +673,13 @@ static void handle_call_stop(pid_t tid, struct user_regs_struct *regs)
         printf("%s\n", pc->args);
         fflush(stdout);
         pc->used = false;
-        regs->rip = real_addr;
+        regs->rip = sl->real_addr;
         ptrace(PTRACE_SETREGS, tid, NULL, regs);
-        ptrace(PTRACE_CONT, target_pid, NULL, NULL);
+        ptrace(PTRACE_CONT, tid, NULL, NULL);
         return;
     }
 
-    regs->rip = real_addr;
+    regs->rip = sl->real_addr;
     ptrace(PTRACE_SETREGS, tid, NULL, regs);
     ptrace(PTRACE_CONT, tid, NULL, NULL);
 }
@@ -670,6 +691,8 @@ static void handle_return_stop(pid_t tid, struct user_regs_struct *regs)
         ptrace(PTRACE_CONT, tid, NULL, NULL);
         return;
     }
+    struct slot *sl = &slots[pc->slot_idx];
+    const struct func_prototype *proto = sl->proto;
 
     char retbuf[96];
     unsigned long long rax = regs->rax;
@@ -750,8 +773,8 @@ static void handle_return_stop(pid_t tid, struct user_regs_struct *regs)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s <pid> <symbol>\n"
-        "       %s -r <symbol> -- <program> [args...]\n"
+        "Usage: %s <pid> <symbol[,symbol...]>\n"
+        "       %s -r <symbol[,symbol...]> -- <program> [args...]\n"
         "\n"
         "Attaches to a running process by pid, or runs <program> under\n"
         "tracing (tracing starts before main, so calls made during\n"
@@ -807,7 +830,7 @@ static uint64_t entry_breakpoint_addr(pid_t pid)
     return 0;
 }
 
-static void trace_child_from_start(pid_t pid, const char *symbol)
+static void trace_child_from_start(pid_t pid)
 {
     int status;
 
@@ -845,41 +868,134 @@ static void trace_child_from_start(pid_t pid, const char *symbol)
 
     nmodules = 0;
     load_maps(pid);
+    setup_slots(pid, true);
+}
 
+/* After modules are loaded and the process is stopped: resolve every
+ * requested symbol (GOT slots, real address, prototype from the table
+ * then DWARF), then patch the GOT slots. Returns false if nothing could
+ * be set up. */
+static bool setup_slots(pid_t pid, bool fatal)
+{
     for (int i = 0; i < nmodules; i++) {
         struct elf_file e;
         if (!elf_load_file(&e, modules[i].path))
             continue;
-        find_got_slots(&e, modules[i].base, symbol);
+        find_got_slots(&e, modules[i].base);
         elf_unload(&e);
-    }
-
-    real_addr = resolve_real_addr(pid, symbol);
-    if (defining_module[0] && try_dwarf_proto(defining_module, symbol))
-        proto = &dw_proto;
-    if (!real_addr || !range_mapped(pid, real_addr)) {
-        fprintf(stderr,
-                "symtrace: cannot resolve real address of '%s' in %d\n",
-                symbol, pid);
-        kill(pid, SIGKILL);
-        exit(1);
     }
 
     if (nslots == 0) {
         fprintf(stderr, "symtrace: no GOT slot for '%s' in %d\n",
-                symbol, pid);
-        kill(pid, SIGKILL);
-        exit(1);
+                symbols[0], pid);
+        if (fatal) {
+            kill(pid, SIGKILL);
+            exit(1);
+        }
+        return false;
     }
 
     for (int i = 0; i < nslots; i++) {
-        uint64_t orig = peek(pid, slots[i].addr);
+        struct slot *sl = &slots[i];
+        sl->proto = proto_lookup(sl->symbol);
+
+        defining_module[0] = '\0';
+        sl->real_addr = resolve_real_addr(pid, sl->symbol);
+        if (!sl->real_addr || !range_mapped(pid, sl->real_addr)) {
+            fprintf(stderr,
+                    "symtrace: cannot resolve real address of '%s' in %d\n",
+                    sl->symbol, pid);
+            if (fatal) {
+                kill(pid, SIGKILL);
+                exit(1);
+            }
+            continue;
+        }
+        if (defining_module[0] &&
+            try_dwarf_proto(&sl->dw, sl->pretty, defining_module, sl->symbol))
+            sl->proto = &sl->dw;
+
+        uint64_t orig = peek(pid, sl->addr);
         if (orig == UINT64_MAX)
             continue;
-        slots[i].orig = orig;
+        sl->orig = orig;
         uint64_t magic = MAGIC_BASE + (uint64_t)i * MAGIC_STRIDE;
-        poke(pid, slots[i].addr, magic);
+        if (poke(pid, sl->addr, magic) < 0)
+            fprintf(stderr, "symtrace: cannot patch GOT slot at %#lx: %s\n",
+                    (unsigned long)sl->addr, strerror(errno));
     }
+
+    /* keep only slots that were patched; compact the array */
+    int w = 0;
+    for (int i = 0; i < nslots; i++) {
+        if (slots[i].orig) {
+            if (w != i) {
+                slots[w] = slots[i];
+                /* re-patch magic with the new index */
+                poke(pid, slots[w].addr,
+                     MAGIC_BASE + (uint64_t)w * MAGIC_STRIDE);
+            }
+            w++;
+        }
+    }
+    nslots = w;
+    if (nslots == 0) {
+        if (fatal) {
+            kill(pid, SIGKILL);
+            exit(1);
+        }
+        return false;
+    }
+    return true;
+}
+
+static void print_summary(void)
+{
+    for (int k = 0; k < nsymbols; k++) {
+        uint64_t total = 0;
+        for (int i = 0; i < nslots; i++)
+            if (strcmp(slots[i].symbol, symbols[k]) == 0)
+                total += slots[i].calls;
+        printf("%s: %lu call%s intercepted\n", symbols[k],
+               (unsigned long)total, total == 1 ? "" : "s");
+    }
+}
+
+static int parse_symbols(const char *spec)
+{
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", spec);
+    char *save = NULL;
+    nsymbols = 0;
+    for (char *tok = strtok_r(tmp, ",", &save); tok && nsymbols < 8;
+         tok = strtok_r(NULL, ",", &save)) {
+        if (!tok[0])
+            continue;
+        bool dup = false;
+        for (int i = 0; i < nsymbols; i++)
+            if (strcmp(symbols[i], tok) == 0)
+                dup = true;
+        if (dup)
+            continue;
+        snprintf(symbol_buf[nsymbols], 64, "%s", tok);
+        symbols[nsymbols] = symbol_buf[nsymbols];
+        nsymbols++;
+    }
+    return nsymbols;
+}
+
+static void print_banner(void)
+{
+    for (int i = 0; i < nslots; i++) {
+        if (slots[i].dw.name)
+            printf("symtrace: prototype from debug info: %s\n",
+                   slots[i].pretty);
+    }
+    printf("symtrace: tracing '%s' in pid %d (%d GOT slot%s) - press Ctrl-C to stop\n",
+           symbols[0], target_pid, nslots, nslots > 1 ? "s" : "");
+    for (int i = 1; i < nsymbols; i++)
+        printf("symtrace: also tracing '%s'\n", symbols[i]);
+    fflush(stdout);
 }
 
 int main(int argc, char **argv)
@@ -889,24 +1005,21 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return 2;
         }
-        const char *symbol = argv[2];
-        traced_symbol = symbol;
-        proto = proto_lookup(symbol);
+        if (parse_symbols(argv[2]) == 0) {
+            fprintf(stderr, "symtrace: no symbol given\n");
+            return 2;
+        }
 
         child_launched = true;
         target_pid = run_target(&argv[4]);
-        trace_child_from_start(target_pid, symbol);
+        trace_child_from_start(target_pid);
 
         if (ptrace(PTRACE_CONT, target_pid, NULL, NULL) < 0) {
             kill(target_pid, SIGKILL);
             die("symtrace: PTRACE_CONT: %s", strerror(errno));
         }
 
-        if (proto == &dw_proto)
-            printf("symtrace: prototype from debug info: %s\n", dw_pretty);
-        printf("symtrace: tracing '%s' in pid %d (%d GOT slot%s) - press Ctrl-C to stop\n",
-               symbol, target_pid, nslots, nslots > 1 ? "s" : "");
-        fflush(stdout);
+        print_banner();
 
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
@@ -928,8 +1041,7 @@ int main(int argc, char **argv)
             if (WIFEXITED(status) || WIFSIGNALED(status)) {
                 printf("symtrace: program exited (status %d)\n",
                        WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
-                printf("%s: %lu call%s intercepted\n", symbol,
-                       (unsigned long)call_count, call_count == 1 ? "" : "s");
+                print_summary();
                 return 0;
             }
             if (!WIFSTOPPED(status))
@@ -954,11 +1066,10 @@ int main(int argc, char **argv)
             if (sig == SIGSEGV) {
                 struct user_regs_struct regs;
                 if (ptrace(PTRACE_GETREGS, tid, NULL, &regs) == 0) {
-                    bool is_magic =
-                        regs.rip >= MAGIC_BASE &&
-                        regs.rip < MAGIC_BASE + (uint64_t)nslots * MAGIC_STRIDE;
-                    if (is_magic) {
-                        handle_call_stop(tid, &regs);
+                    if (regs.rip >= MAGIC_BASE &&
+                        regs.rip < MAGIC_BASE + (uint64_t)nslots * MAGIC_STRIDE) {
+                        handle_call_stop(tid, &regs,
+                                         (int)((regs.rip - MAGIC_BASE) / MAGIC_STRIDE));
                         continue;
                     }
                     if (regs.rip >= MAGIC_RET_BASE &&
@@ -984,8 +1095,7 @@ int main(int argc, char **argv)
         if (stopped)
             restore_and_detach(target_pid);
 
-        printf("%s: %lu call%s intercepted\n", symbol,
-               (unsigned long)call_count, call_count == 1 ? "" : "s");
+        print_summary();
         return 0;
     }
 
@@ -995,58 +1105,23 @@ int main(int argc, char **argv)
     }
 
     target_pid = (pid_t)atoi(argv[1]);
-    const char *symbol = argv[2];
-    traced_symbol = symbol;
-    proto = proto_lookup(symbol);
     if (target_pid <= 0)
         die("symtrace: invalid pid '%s'", argv[1]);
+    if (parse_symbols(argv[2]) == 0) {
+        fprintf(stderr, "symtrace: no symbol given\n");
+        return 2;
+    }
 
     attach_all_threads(target_pid);
 
     load_maps(target_pid);
-
-    for (int i = 0; i < nmodules; i++) {
-        struct elf_file e;
-        if (!elf_load_file(&e, modules[i].path))
-            continue;
-        find_got_slots(&e, modules[i].base, symbol);
-        elf_unload(&e);
-    }
-
-    if (nslots == 0) {
-        fprintf(stderr, "symtrace: no GOT slot for '%s' in %d\n",
-                symbol, target_pid);
-        ptrace(PTRACE_DETACH, target_pid, NULL, NULL);
+    if (!setup_slots(target_pid, false)) {
+        for (int t = 0; t < nthreads; t++)
+            ptrace(PTRACE_DETACH, threads[t], NULL, NULL);
         return 1;
     }
 
-    real_addr = resolve_real_addr(target_pid, symbol);
-    if (defining_module[0] && try_dwarf_proto(defining_module, symbol))
-        proto = &dw_proto;
-    if (!real_addr || !range_mapped(target_pid, real_addr)) {
-        fprintf(stderr,
-                "symtrace: cannot resolve real address of '%s' in %d\n",
-                symbol, target_pid);
-        ptrace(PTRACE_DETACH, target_pid, NULL, NULL);
-        return 1;
-    }
-
-    for (int i = 0; i < nslots; i++) {
-        uint64_t orig = peek(target_pid, slots[i].addr);
-        if (orig == UINT64_MAX)
-            continue;
-        slots[i].orig = orig;
-        uint64_t magic = MAGIC_BASE + (uint64_t)i * MAGIC_STRIDE;
-        if (poke(target_pid, slots[i].addr, magic) < 0)
-            fprintf(stderr, "symtrace: cannot patch GOT slot at %#lx: %s\n",
-                    (unsigned long)slots[i].addr, strerror(errno));
-    }
-
-    if (proto == &dw_proto)
-        printf("symtrace: prototype from debug info: %s\n", dw_pretty);
-    printf("symtrace: tracing '%s' in pid %d (%d GOT slot%s) - press Ctrl-C to stop\n",
-           symbol, target_pid, nslots, nslots > 1 ? "s" : "");
-    fflush(stdout);
+    print_banner();
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -1099,11 +1174,10 @@ int main(int argc, char **argv)
         if (sig == SIGSEGV) {
             struct user_regs_struct regs;
             if (ptrace(PTRACE_GETREGS, tid, NULL, &regs) == 0) {
-                bool is_magic =
-                    regs.rip >= MAGIC_BASE &&
-                    regs.rip < MAGIC_BASE + (uint64_t)nslots * MAGIC_STRIDE;
-                if (is_magic) {
-                    handle_call_stop(tid, &regs);
+                if (regs.rip >= MAGIC_BASE &&
+                    regs.rip < MAGIC_BASE + (uint64_t)nslots * MAGIC_STRIDE) {
+                    handle_call_stop(tid, &regs,
+                                     (int)((regs.rip - MAGIC_BASE) / MAGIC_STRIDE));
                     continue;
                 }
                 if (regs.rip >= MAGIC_RET_BASE &&
@@ -1129,7 +1203,6 @@ int main(int argc, char **argv)
     if (stopped)
         restore_and_detach(target_pid);
 
-    printf("%s: %lu call%s intercepted\n", symbol,
-           (unsigned long)call_count, call_count == 1 ? "" : "s");
+    print_summary();
     return 0;
 }
