@@ -21,6 +21,14 @@ struct dw_file {
     size_t str_size;
     const unsigned char *line_str;
     size_t line_str_size;
+
+    struct cu_desc {
+        uint64_t die_start;   /* offset of first DIE in .debug_info */
+        uint64_t cu_end;      /* offset just past the CU */
+        uint64_t abbrev_off;
+        uint16_t version;
+    } cus[256];
+    int ncus;
 };
 
 static uint64_t rd_u(const unsigned char **p, int width)
@@ -95,7 +103,43 @@ static bool dw_open(struct dw_file *f, const char *path)
             f->line_str_size = sh->sh_size;
         }
     }
-    return f->info && f->abbrev;
+    if (!f->info || !f->abbrev)
+        return false;
+
+    f->ncus = 0;
+    const unsigned char *cu = f->info;
+    while (cu + 4 < f->info + f->info_size &&
+           f->ncus < 256) {
+        const unsigned char *h = cu;
+        uint64_t unit_len = rd_u(&h, 4);
+        bool dwarf64 = (unit_len == 0xffffffffULL);
+        if (dwarf64)
+            unit_len = rd_u(&h, 8);
+        if (unit_len == 0 || cu + 4 + unit_len > f->info + f->info_size)
+            break;
+        uint64_t cu_end = (uint64_t)(cu - f->info) + 4 + unit_len;
+        if (dwarf64)
+            cu_end += 4;
+        uint16_t version = (uint16_t)rd_u(&h, 2);
+        uint64_t abbrev_off;
+        uint64_t die_start;
+        if (version >= 5) {
+            h += 2;
+            abbrev_off = dwarf64 ? rd_u(&h, 8) : rd_u(&h, 4);
+            die_start = (uint64_t)(h - f->info);
+        } else {
+            abbrev_off = dwarf64 ? rd_u(&h, 8) : rd_u(&h, 4);
+            h += 1;
+            die_start = (uint64_t)(h - f->info);
+        }
+        f->cus[f->ncus].die_start = die_start;
+        f->cus[f->ncus].cu_end = cu_end;
+        f->cus[f->ncus].abbrev_off = abbrev_off;
+        f->cus[f->ncus].version = version;
+        f->ncus++;
+        cu = f->info + cu_end;
+    }
+    return f->ncus > 0;
 }
 
 static void dw_close(struct dw_file *f)
@@ -169,6 +213,8 @@ static bool attr_get(struct dw_file *f, const unsigned char **p, uint64_t form,
         *u = rd_u(p, 2); break;
     case DW_FORM_data4: case DW_FORM_ref4: case DW_FORM_sec_offset:
         *u = rd_u(p, 4); break;
+    case DW_FORM_ref_addr:
+        *u = rd_u(p, 8); break;
     case DW_FORM_strp: {
         uint64_t off = rd_u(p, 4);
         *u = off;
@@ -300,8 +346,21 @@ static const unsigned char *die_at(struct dw_file *f, uint64_t die_start,
                                   uint64_t abbrev_off, uint64_t target_off,
                                   uint64_t cu_end)
 {
-    if (target_off >= f->info_size || target_off >= cu_end)
+    if (target_off >= f->info_size)
         return NULL;
+
+    if (target_off >= cu_end) {
+        /* DW_FORM_ref_addr (absolute .debug_info offset): find the CU
+         * that owns the offset and walk from its first DIE. */
+        for (int i = 0; i < f->ncus; i++) {
+            if (target_off < f->cus[i].cu_end) {
+                return die_at(f, f->cus[i].die_start, f->cus[i].abbrev_off,
+                              target_off, f->cus[i].cu_end);
+            }
+        }
+        return NULL;
+    }
+
     const unsigned char *cur = f->info + die_start;
     const unsigned char *end = f->info + cu_end;
     int depth = 0;
