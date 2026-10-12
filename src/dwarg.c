@@ -21,6 +21,9 @@ struct dw_file {
     size_t str_size;
     const unsigned char *line_str;
     size_t line_str_size;
+    const unsigned char *str_offsets;
+    size_t str_offsets_size;
+    uint64_t str_offsets_base;   /* set per CU in DWARF5 via DW_AT_str_offsets_base */
 
     struct cu_desc {
         uint64_t die_start;   /* offset of first DIE in .debug_info */
@@ -101,6 +104,9 @@ static bool dw_open(struct dw_file *f, const char *path)
         } else if (strcmp(n, ".debug_line_str") == 0) {
             f->line_str = f->base + sh->sh_offset;
             f->line_str_size = sh->sh_size;
+        } else if (strcmp(n, ".debug_str_offsets") == 0) {
+            f->str_offsets = f->base + sh->sh_offset;
+            f->str_offsets_size = sh->sh_size;
         }
     }
     if (!f->info || !f->abbrev)
@@ -207,9 +213,8 @@ static bool attr_get(struct dw_file *f, const unsigned char **p, uint64_t form,
     switch (form) {
     case DW_FORM_addr: *u = rd_u(p, 8); break;
     case DW_FORM_data1: case DW_FORM_flag: case DW_FORM_ref1:
-    case DW_FORM_strx1:
         *u = rd_u(p, 1); break;
-    case DW_FORM_data2: case DW_FORM_ref2: case DW_FORM_strx2:
+    case DW_FORM_data2: case DW_FORM_ref2:
         *u = rd_u(p, 2); break;
     case DW_FORM_data4: case DW_FORM_ref4: case DW_FORM_sec_offset:
         *u = rd_u(p, 4); break;
@@ -236,8 +241,33 @@ static bool attr_get(struct dw_file *f, const unsigned char **p, uint64_t form,
     case DW_FORM_data8: case DW_FORM_ref8: case DW_FORM_ref_sig8:
         *u = rd_u(p, 8); break;
     case DW_FORM_sdata: *u = rd_leb(p, true); break;
-    case DW_FORM_udata: case DW_FORM_ref_udata: case DW_FORM_strx:
+    case DW_FORM_udata: case DW_FORM_ref_udata:
         *u = rd_leb(p, false); break;
+    case DW_FORM_strx: case DW_FORM_strx1: case DW_FORM_strx2:
+    case DW_FORM_strx3: case DW_FORM_strx4: {
+        if (form == DW_FORM_strx)
+            *u = rd_leb(p, false);
+        else if (form == DW_FORM_strx1)
+            *u = rd_u(p, 1);
+        else if (form == DW_FORM_strx2)
+            *u = rd_u(p, 2);
+        else if (form == DW_FORM_strx3)
+            *u = rd_u(p, 3);
+        else
+            *u = rd_u(p, 4);
+        if (f->str_offsets && f->str) {
+            uint64_t entry = f->str_offsets_base + *u * 4;
+            if (entry + 4 <= f->str_offsets_size) {
+                uint32_t off;
+                memcpy(&off, f->str_offsets + entry, 4);
+                if (off < f->str_size && s) {
+                    *s = (const char *)(f->str + off);
+                    *is_str = true;
+                }
+            }
+        }
+        break;
+    }
     case DW_FORM_string:
         if (s) { *s = (const char *)*p; *is_str = true; }
         while (*(*p)++) ;
@@ -406,6 +436,19 @@ static enum arg_type die_classify(struct dw_file *f, const unsigned char *die,
     if (depth > 8)
         return TYPE_POINTER;
 
+    if (getenv("DWARG_DEBUG")) {
+        const char *nm = NULL;
+        for (int i = 0; i < ab.nattrs; i++) {
+            uint64_t u; const char *sv; bool is;
+            const unsigned char *q = die + 1;
+            /* re-read name only */
+        }
+        fprintf(stderr, "  DIE off=%#lx tag=%#lx enc=%lu bytes=%lu type_ref=%#lx\n",
+                (unsigned long)(die - f->info), (unsigned long)ab.tag,
+                (unsigned long)enc, (unsigned long)bytes,
+                (unsigned long)type_ref);
+    }
+
     switch (ab.tag) {
     case DW_TAG_base_type:
     case DW_TAG_enumeration_type:
@@ -432,9 +475,29 @@ static enum arg_type classify_type(struct dw_file *f, uint64_t die_start,
                                    uint64_t abbrev_off, uint64_t type_off,
                                    uint64_t cu_end, int depth)
 {
+    /* if the target lives in another CU, switch to that CU's context
+     * (its die range and abbrev table) for the whole remaining chain */
+    if (type_off >= cu_end && type_off < f->info_size) {
+        for (int i = 0; i < f->ncus; i++) {
+            if (type_off < f->cus[i].cu_end) {
+                die_start = f->cus[i].die_start;
+                abbrev_off = f->cus[i].abbrev_off;
+                cu_end = f->cus[i].cu_end;
+                break;
+            }
+        }
+    }
+    if (getenv("DWARG_DEBUG"))
+        fprintf(stderr, "classify_type: following ref %#lx (cu range [%#lx,%#lx))\n",
+                (unsigned long)type_off, (unsigned long)die_start,
+                (unsigned long)cu_end);
     const unsigned char *die = die_at(f, die_start, abbrev_off, type_off, cu_end);
-    if (!die)
+    if (!die) {
+        if (getenv("DWARG_DEBUG"))
+            fprintf(stderr, "classify_type: DEAD REF %#lx\n",
+                    (unsigned long)type_off);
         return TYPE_POINTER;
+    }
     return die_classify(f, die, die_start, abbrev_off, cu_end, depth);
 }
 
