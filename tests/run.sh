@@ -247,6 +247,50 @@ else
     fail=1
 fi
 
+
+# ---------- symtrace (long symbol names, multiple) ----------
+
+cat > "$TMP/two.c" <<'TWOEOF'
+#include <stdio.h>
+void Tcl_CreateObjCommand(const char *n) { printf("obj %s\n", n); }
+void Tcl_CreateNamespace(const char *n)  { printf("ns %s\n", n); }
+TWOEOF
+
+cat > "$TMP/twomain.c" <<'TWOMAINEOF'
+#include <unistd.h>
+extern void Tcl_CreateObjCommand(const char *);
+extern void Tcl_CreateNamespace(const char *);
+int main(void)
+{
+    for (int i = 0; i < 2; i++) {
+        Tcl_CreateObjCommand("cmd");
+        Tcl_CreateNamespace("ns");
+    }
+    return 0;
+}
+TWOMAINEOF
+
+gcc -O0 -shared -fPIC -o "$TMP/libtwo.so" "$TMP/two.c" \
+    || { echo "FAIL: build two lib"; exit 1; }
+gcc -O0 -o "$TMP/twomain" "$TMP/twomain.c" -L"$TMP" -ltwo \
+    -Wl,-rpath,"$TMP" || { echo "FAIL: build twomain"; exit 1; }
+
+"$ROOT/symtrace" -r Tcl_CreateObjCommand,Tcl_CreateNamespace -- "$TMP/twomain" \
+    > "$TMP/two.out" 2>&1
+rc=$?
+if [ "$rc" = "0" ] \
+   && grep -q "tracing 'Tcl_CreateObjCommand'" "$TMP/two.out" \
+   && grep -q 'Tcl_CreateObjCommand(' "$TMP/two.out" \
+   && grep -q 'Tcl_CreateNamespace(' "$TMP/two.out" \
+   && grep -q 'Tcl_CreateObjCommand: 2 calls intercepted' "$TMP/two.out" \
+   && grep -q 'Tcl_CreateNamespace: 2 calls intercepted' "$TMP/two.out"; then
+    echo "ok: multiple long-named symbols traced together"
+else
+    echo "FAIL: multiple long-named symbols (rc=$rc)"
+    cat "$TMP/two.out"
+    fail=1
+fi
+
 # ---------- symtrace (attach mode) ----------
 
 cat > "$TMP/victim.c" <<'EOF'

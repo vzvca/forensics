@@ -81,7 +81,7 @@ static struct module modules[MAX_MODULES];
 static int nmodules;
 static struct slot slots[MAX_SLOTS];
 static int nslots;
-static char symbol_buf[64][8];
+static char symbol_buf[8][64];
 static const char *symbols[8];
 static int nsymbols;
 
@@ -516,6 +516,8 @@ static uint64_t resolve_real_addr(pid_t pid, const char *symbol)
         elf_unload(&e);
     }
     for (int s = 0; s < nslots; s++) {
+        if (slots[s].orig)
+            continue; /* already patched with a magic address */
         uint64_t v = peek(pid, slots[s].addr);
         if (v != UINT64_MAX && v && (v & 0xfff) != 0x000)
             return v;
@@ -977,7 +979,7 @@ static int parse_symbols(const char *spec)
                 dup = true;
         if (dup)
             continue;
-        snprintf(symbol_buf[nsymbols], 64, "%s", tok);
+        snprintf(symbol_buf[nsymbols], sizeof(symbol_buf[0]), "%s", tok);
         symbols[nsymbols] = symbol_buf[nsymbols];
         nsymbols++;
     }
