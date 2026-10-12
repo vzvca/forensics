@@ -988,9 +988,12 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    if (ptrace(PTRACE_CONT, target_pid, NULL, NULL) < 0) {
-        restore_and_detach(target_pid);
-        die("symtrace: PTRACE_CONT: %s", strerror(errno));
+    for (int t = 0; t < nthreads; t++) {
+        if (ptrace(PTRACE_CONT, threads[t], NULL, NULL) < 0) {
+            restore_and_detach(target_pid);
+            die("symtrace: PTRACE_CONT on thread %d: %s",
+                threads[t], strerror(errno));
+        }
     }
 
     int status;
