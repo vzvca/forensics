@@ -111,7 +111,32 @@ read(3, 0x7f00a1b2c3d0, 4096)
 somefunc(rdi=0x1 rsi=0x7ffd0000 rdx=0x0 rcx=0x0 r8=0x0 r9=0x7f00...)
 ```
 
-Later versions will get prototypes from DWARF or user declarations.
+### Prototypes from debug info (DWARF)
+
+If the module that defines the traced symbol carries DWARF debug
+information - either inline (compiled with `-g`) or in a separate file
+referenced by the `.gnu_debuglink` section (`objcopy --only-keep-debug`
++ `strip -g` workflow, also `/usr/lib/debug/...`) - symtrace parses
+`.debug_info`/`.debug_abbrev`/`.debug_str`/`.debug_line_str` (DWARF 4
+and 5) itself, extracts the `DW_TAG_subprogram` entry, follows the
+`DW_AT_type` chains of its formal parameters and classifies them
+(int/unsigned/char/char*/ptr/double/float). The hard-coded table is
+only a fallback:
+
+```
+$ symtrace -r greet -- ./dwmain
+symtrace: prototype from debug info: greet(char*, int)
+symtrace: tracing 'greet' in pid 3772 (2 GOT slots) - press Ctrl-C to stop
+greet("world", 1) = 12
+...
+```
+
+The resolved prototype is printed in the banner so it is always visible
+which decoding is in effect. The DWARF parser is self-contained C
+(`src/dwarg.c`, no libdw/libelf dependency), handles 32/64-bit DWARF
+offsets, recursive typedef chains, pointer-to-char detection (printed as
+a string), and stops at `DW_TAG_unspecified_parameters` for variadic
+functions.
 
 ### Return value capture
 

@@ -27,6 +27,7 @@
 
 #include "elfparse.h"
 #include "prototypes.h"
+#include "dwarg.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -74,6 +75,58 @@ static int nmodules;
 static struct slot slots[MAX_SLOTS];
 static int nslots;
 static uint64_t real_addr;
+static struct func_prototype dw_proto;
+static char dw_pretty[256];
+
+static bool try_dwarf_proto(const char *elf_path, const char *symbol)
+{
+    enum arg_type args[8];
+    enum ret_type ret;
+    char pretty[256];
+
+    if (dwarf_func_prototype(elf_path, symbol, args, &ret, pretty)) {
+        memset(&dw_proto, 0, sizeof(dw_proto));
+        dw_proto.name = symbol;
+        dw_proto.ret = ret;
+        for (int i = 0; i < 8; i++)
+            dw_proto.args[i] = args[i];
+        snprintf(dw_pretty, sizeof(dw_pretty), "%s", pretty);
+        return true;
+    }
+
+    uint32_t crc;
+    char *link = dwarf_debuglink(elf_path, &crc);
+    if (!link)
+        return false;
+
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", elf_path);
+    char *slash = strrchr(dir, '/');
+    if (slash)
+        *slash = '\0';
+    else
+        strcpy(dir, ".");
+
+    const char *suffixes[] = { "%s/%s", "%s/.debug/%s", "/usr/lib/debug%s/%s", NULL };
+    for (int i = 0; suffixes[i]; i++) {
+        char cand[PATH_MAX];
+        snprintf(cand, sizeof(cand), suffixes[i], dir, link);
+        if (access(cand, R_OK) == 0 &&
+            dwarf_func_prototype(cand, symbol, args, &ret, pretty)) {
+            memset(&dw_proto, 0, sizeof(dw_proto));
+            dw_proto.name = symbol;
+            dw_proto.ret = ret;
+            for (int j = 0; j < 8; j++)
+                dw_proto.args[j] = args[j];
+            snprintf(dw_pretty, sizeof(dw_pretty), "%s", pretty);
+            free(link);
+            return true;
+        }
+    }
+    free(link);
+    return false;
+}
+
 static uint64_t call_count;
 static volatile sig_atomic_t interrupted;
 static pid_t target_pid;
@@ -421,6 +474,8 @@ static void find_got_slots(const struct elf_file *e, uint64_t base,
     }
 }
 
+static char defining_module[PATH_MAX];
+
 static uint64_t resolve_real_addr(pid_t pid, const char *symbol)
 {
     for (int i = 0; i < nmodules; i++) {
@@ -432,8 +487,11 @@ static uint64_t resolve_real_addr(pid_t pid, const char *symbol)
             if (n && strcmp(n, symbol) == 0 && elf_sym_defined(&e, s)) {
                 uint64_t v = elf_sym_value(&e, s);
                 elf_unload(&e);
-                if (v)
+                if (v) {
+                    snprintf(defining_module, sizeof(defining_module), "%s",
+                             modules[i].path);
                     return modules[i].base + v;
+                }
                 return 0;
             }
         }
@@ -797,6 +855,8 @@ static void trace_child_from_start(pid_t pid, const char *symbol)
     }
 
     real_addr = resolve_real_addr(pid, symbol);
+    if (defining_module[0] && try_dwarf_proto(defining_module, symbol))
+        proto = &dw_proto;
     if (!real_addr || !range_mapped(pid, real_addr)) {
         fprintf(stderr,
                 "symtrace: cannot resolve real address of '%s' in %d\n",
@@ -842,6 +902,8 @@ int main(int argc, char **argv)
             die("symtrace: PTRACE_CONT: %s", strerror(errno));
         }
 
+        if (proto == &dw_proto)
+            printf("symtrace: prototype from debug info: %s\n", dw_pretty);
         printf("symtrace: tracing '%s' in pid %d (%d GOT slot%s) - press Ctrl-C to stop\n",
                symbol, target_pid, nslots, nslots > 1 ? "s" : "");
         fflush(stdout);
@@ -959,6 +1021,8 @@ int main(int argc, char **argv)
     }
 
     real_addr = resolve_real_addr(target_pid, symbol);
+    if (defining_module[0] && try_dwarf_proto(defining_module, symbol))
+        proto = &dw_proto;
     if (!real_addr || !range_mapped(target_pid, real_addr)) {
         fprintf(stderr,
                 "symtrace: cannot resolve real address of '%s' in %d\n",
@@ -978,6 +1042,8 @@ int main(int argc, char **argv)
                     (unsigned long)slots[i].addr, strerror(errno));
     }
 
+    if (proto == &dw_proto)
+        printf("symtrace: prototype from debug info: %s\n", dw_pretty);
     printf("symtrace: tracing '%s' in pid %d (%d GOT slot%s) - press Ctrl-C to stop\n",
            symbol, target_pid, nslots, nslots > 1 ? "s" : "");
     fflush(stdout);

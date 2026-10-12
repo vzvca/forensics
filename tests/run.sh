@@ -144,6 +144,57 @@ else
     fail=1
 fi
 
+# ---------- symtrace (DWARF prototype) ----------
+
+cat > "$TMP/greetlib.c" <<'GRLIBEOF'
+#include <stdio.h>
+int greet(const char *who, int times)
+{
+    int r = 0;
+    for (int i = 0; i < times; i++)
+        r += printf("hello %s\n", who);
+    return r;
+}
+GRLIBEOF
+
+cat > "$TMP/greetmain.c" <<'GRMAINEOF'
+#include <unistd.h>
+int greet(const char *who, int times);
+int main(void) { greet("world", 1); return 0; }
+GRMAINEOF
+
+gcc -g -O0 -shared -fPIC -o "$TMP/libgreet.so" "$TMP/greetlib.c" \
+    || { echo "FAIL: build greet lib"; exit 1; }
+gcc -g -O0 -o "$TMP/greetmain" "$TMP/greetmain.c" -L"$TMP" -lgreet \
+    -Wl,-rpath,"$TMP" || { echo "FAIL: build greet main"; exit 1; }
+
+# inline debug info
+"$ROOT/symtrace" -r greet -- "$TMP/greetmain" > "$TMP/greet1.out" 2>&1
+if grep -q 'prototype from debug info: greet(char\*, int)' "$TMP/greet1.out" \
+   && grep -q 'greet("world", 1) = ' "$TMP/greet1.out"; then
+    echo "ok: DWARF prototype used (inline debug info)"
+else
+    echo "FAIL: DWARF prototype (inline)"
+    cat "$TMP/greet1.out"
+    fail=1
+fi
+
+# separate debug file via .gnu_debuglink
+objcopy --only-keep-debug "$TMP/libgreet.so" "$TMP/libgreet.so.debug" \
+    && strip -g "$TMP/libgreet.so" \
+    && (cd "$TMP" && objcopy --add-gnu-debuglink=./libgreet.so.debug ./libgreet.so) \
+    || { echo "FAIL: objcopy debuglink"; exit 1; }
+
+"$ROOT/symtrace" -r greet -- "$TMP/greetmain" > "$TMP/greet2.out" 2>&1
+if grep -q 'prototype from debug info: greet(char\*, int)' "$TMP/greet2.out" \
+   && grep -q 'greet("world", 1) = ' "$TMP/greet2.out"; then
+    echo "ok: DWARF prototype used (separate .gnu_debuglink file)"
+else
+    echo "FAIL: DWARF prototype (debuglink)"
+    cat "$TMP/greet2.out"
+    fail=1
+fi
+
 # ---------- symtrace (attach mode) ----------
 
 cat > "$TMP/victim.c" <<'EOF'

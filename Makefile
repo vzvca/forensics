@@ -2,18 +2,21 @@ CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
 
 BINS = symfind symtrace
-OBJS = elfparse.o
+OBJS = elfparse.o dwarg.o
 
 all: $(BINS)
 
 elfparse.o: src/elfparse.c src/elfparse.h
 	$(CC) $(CFLAGS) -c -o $@ src/elfparse.c
 
-symfind: src/symfind.c $(OBJS) src/elfparse.h
-	$(CC) $(CFLAGS) -o $@ src/symfind.c $(OBJS)
+dwarg.o: src/dwarg.c src/dwarg.h src/dwarf_consts.h src/prototypes.h
+	$(CC) $(CFLAGS) -c -o $@ src/dwarg.c
 
-symtrace: src/symtrace.c $(OBJS) src/elfparse.h
-	$(CC) $(CFLAGS) -o $@ src/symtrace.c $(OBJS)
+symfind: src/symfind.c elfparse.o src/elfparse.h
+	$(CC) $(CFLAGS) -o $@ src/symfind.c elfparse.o
+
+symtrace: src/symtrace.c elfparse.o dwarg.o src/elfparse.h src/dwarg.h src/prototypes.h
+	$(CC) $(CFLAGS) -o $@ src/symtrace.c elfparse.o dwarg.o
 
 test: $(BINS)
 	./tests/run.sh
