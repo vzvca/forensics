@@ -115,7 +115,36 @@ check_rc "missing symbol reported not found" 1 "$TMP/testbin" symbol_that_exists
 
 check_rc "invalid regex reported" 2 -r "$TMP/testbin" '['
 
-# ---------- symtrace ----------
+# ---------- symtrace (launch mode) ----------
+
+cat > "$TMP/spawn.c" <<'SPAWNEOF'
+#include <stdio.h>
+int main(void)
+{
+    FILE *f = fopen("/etc/hostname", "r");
+    if (f)
+        fclose(f);
+    f = fopen("/etc/hostname", "r");
+    if (f)
+        fclose(f);
+    return 0;
+}
+SPAWNEOF
+
+gcc -O0 -o "$TMP/spawn" "$TMP/spawn.c" || { echo "FAIL: build spawn"; exit 1; }
+
+"$ROOT/symtrace" -r fopen -- "$TMP/spawn" > "$TMP/spawn.out" 2>&1
+rc=$?
+if [ "$rc" = "0" ] && grep -q 'fopen("/etc/hostname", "r") = ' "$TMP/spawn.out" \
+   && grep -q '2 calls intercepted' "$TMP/spawn.out"; then
+    echo "ok: symtrace launch mode traced calls from process start"
+else
+    echo "FAIL: symtrace launch mode (rc=$rc)"
+    cat "$TMP/spawn.out"
+    fail=1
+fi
+
+# ---------- symtrace (attach mode) ----------
 
 cat > "$TMP/victim.c" <<'EOF'
 #include <stdio.h>

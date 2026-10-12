@@ -66,12 +66,17 @@ $ symfind -r /bin/grep '^pc?re2_compile'
 `symtrace` attaches to a **running process** identified by its PID and
 counts every call to a function identified by its symbol name. The library
 that actually provides the function is discovered by reusing the same
-ELF-parsing core as `symfind`.
+ELF-parsing core as `symfind`. With `-r`, the program is forked with
+`PTRACE_TRACEME` and a breakpoint is placed on the ELF entry point, so
+tracing is active before `main` runs and calls made during startup
+(static constructors, library init) are caught too. The trace ends
+automatically when the program exits.
 
 ### Usage
 
 ```
-symtrace <pid> <symbol>
+symtrace <pid> <symbol>                    # attach to a running process
+symtrace -r <symbol> -- <program> [args]   # start a program under tracing
 ```
 
 Press Ctrl-C to stop tracing; the summary is printed:

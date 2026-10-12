@@ -482,6 +482,8 @@ static void restore_and_detach(pid_t pid)
         ptrace(PTRACE_DETACH, threads[t], NULL, NULL);
 }
 
+static bool child_launched;
+
 static void attach_all_threads(pid_t pid)
 {
     char taskdir[64];
@@ -497,6 +499,10 @@ static void attach_all_threads(pid_t pid)
         pid_t tid = (pid_t)atoi(ent->d_name);
         if (nthreads >= MAX_THREADS)
             break;
+        if (child_launched) {
+            threads[nthreads++] = tid;
+            continue;
+        }
         if (ptrace(PTRACE_ATTACH, tid, NULL, NULL) < 0) {
             fprintf(stderr, "symtrace: cannot attach to thread %d: %s\n",
                     tid, strerror(errno));
@@ -507,6 +513,8 @@ static void attach_all_threads(pid_t pid)
     closedir(d);
     if (nthreads == 0)
         die("symtrace: could not attach to any thread of %d", pid);
+    if (child_launched)
+        return;
     for (int t = 0; t < nthreads; t++) {
         int status;
         pid_t r;
@@ -681,12 +689,246 @@ static void handle_return_stop(pid_t tid, struct user_regs_struct *regs)
     ptrace(PTRACE_CONT, tid, NULL, NULL);
 }
 
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "Usage: %s <pid> <symbol>\n"
+        "       %s -r <symbol> -- <program> [args...]\n"
+        "\n"
+        "Attaches to a running process by pid, or runs <program> under\n"
+        "tracing (tracing starts before main, so calls made during\n"
+        "startup are caught).\n"
+        "Press Ctrl-C to stop and print the summary.\n",
+        prog, prog);
+}
+
+static pid_t run_target(char **argv)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        die("symtrace: fork: %s", strerror(errno));
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, NULL, NULL, NULL);
+        execvp(argv[0], argv);
+        fprintf(stderr, "symtrace: exec %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+    int status;
+    if (waitpid(pid, &status, 0) < 0)
+        die("symtrace: waitpid: %s", strerror(errno));
+    if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
+        die("symtrace: unexpected child stop status %#x", status);
+    ptrace(PTRACE_SETOPTIONS, pid, NULL,
+           (void *)(long)(PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC));
+    return pid;
+}
+
+static uint64_t entry_breakpoint_addr(pid_t pid)
+{
+    char exepath[64];
+    snprintf(exepath, sizeof(exepath), "/proc/%d/exe", pid);
+    char real[PATH_MAX];
+    ssize_t n = readlink(exepath, real, sizeof(real) - 1);
+    if (n < 0)
+        return 0;
+    real[n] = '\0';
+
+    struct elf_file e;
+    if (!elf_load_file(&e, real))
+        return 0;
+    if (!e.is64) {
+        elf_unload(&e);
+        return 0;
+    }
+    uint64_t entry = e.eh64->e_entry;
+    elf_unload(&e);
+
+    for (int i = 0; i < nmodules; i++)
+        if (strcmp(modules[i].path, real) == 0)
+            return modules[i].base + entry;
+    return 0;
+}
+
+static void trace_child_from_start(pid_t pid, const char *symbol)
+{
+    int status;
+
+    load_maps(pid);
+    uint64_t bp = entry_breakpoint_addr(pid);
+    unsigned long orig_word = 0;
+    if (bp) {
+        errno = 0;
+        orig_word = ptrace(PTRACE_PEEKDATA, pid, (void *)bp, NULL);
+        if (errno == 0 && ptrace(PTRACE_POKEDATA, pid, (void *)bp,
+                                 (void *)((orig_word & ~0xffUL) | 0xCCUL)) == 0) {
+            ptrace(PTRACE_CONT, pid, NULL, NULL);
+            for (;;) {
+                if (waitpid(pid, &status, 0) < 0)
+                    die("symtrace: waitpid: %s", strerror(errno));
+                if (WIFEXITED(status) || WIFSIGNALED(status))
+                    die("symtrace: program exited before reaching entry point");
+                if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+                    break;
+                if (WIFSTOPPED(status)) {
+                    int sig = WSTOPSIG(status);
+                    ptrace(PTRACE_CONT, pid, NULL,
+                           sig == SIGSTOP ? NULL : (void *)(long)sig);
+                }
+            }
+            struct user_regs_struct regs;
+            ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+            regs.rip = bp;
+            ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+            ptrace(PTRACE_POKEDATA, pid, (void *)bp, (void *)orig_word);
+        }
+    }
+
+    attach_all_threads(pid);
+
+    nmodules = 0;
+    load_maps(pid);
+
+    for (int i = 0; i < nmodules; i++) {
+        struct elf_file e;
+        if (!elf_load_file(&e, modules[i].path))
+            continue;
+        find_got_slots(&e, modules[i].base, symbol);
+        elf_unload(&e);
+    }
+
+    real_addr = resolve_real_addr(pid, symbol);
+    if (!real_addr || !range_mapped(pid, real_addr)) {
+        fprintf(stderr,
+                "symtrace: cannot resolve real address of '%s' in %d\n",
+                symbol, pid);
+        kill(pid, SIGKILL);
+        exit(1);
+    }
+
+    if (nslots == 0) {
+        fprintf(stderr, "symtrace: no GOT slot for '%s' in %d\n",
+                symbol, pid);
+        kill(pid, SIGKILL);
+        exit(1);
+    }
+
+    for (int i = 0; i < nslots; i++) {
+        uint64_t orig = peek(pid, slots[i].addr);
+        if (orig == UINT64_MAX)
+            continue;
+        slots[i].orig = orig;
+        uint64_t magic = MAGIC_BASE + (uint64_t)i * MAGIC_STRIDE;
+        poke(pid, slots[i].addr, magic);
+    }
+}
+
 int main(int argc, char **argv)
 {
+    if (argc >= 2 && strcmp(argv[1], "-r") == 0) {
+        if (argc < 5 || strcmp(argv[3], "--") != 0) {
+            usage(argv[0]);
+            return 2;
+        }
+        const char *symbol = argv[2];
+        traced_symbol = symbol;
+        proto = proto_lookup(symbol);
+
+        child_launched = true;
+        target_pid = run_target(&argv[4]);
+        trace_child_from_start(target_pid, symbol);
+
+        if (ptrace(PTRACE_CONT, target_pid, NULL, NULL) < 0) {
+            kill(target_pid, SIGKILL);
+            die("symtrace: PTRACE_CONT: %s", strerror(errno));
+        }
+
+        printf("symtrace: tracing '%s' in pid %d (%d GOT slot%s) - press Ctrl-C to stop\n",
+               symbol, target_pid, nslots, nslots > 1 ? "s" : "");
+        fflush(stdout);
+
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_sigint;
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+
+        int status;
+        while (1) {
+            pid_t r = waitpid(-1, &status, __WALL);
+            if (r < 0) {
+                if (errno == EINTR) {
+                    if (interrupted)
+                        break;
+                    continue;
+                }
+                break;
+            }
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                printf("symtrace: program exited (status %d)\n",
+                       WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
+                printf("%s: %lu call%s intercepted\n", symbol,
+                       (unsigned long)call_count, call_count == 1 ? "" : "s");
+                return 0;
+            }
+            if (!WIFSTOPPED(status))
+                continue;
+            pid_t tid = r;
+            int sig = WSTOPSIG(status);
+
+            if (status >> 16 == PTRACE_EVENT_CLONE) {
+                unsigned long newtid;
+                if (ptrace(PTRACE_GETEVENTMSG, tid, NULL, &newtid) == 0 &&
+                    nthreads < MAX_THREADS && newtid != 0)
+                    threads[nthreads++] = (pid_t)newtid;
+                ptrace(PTRACE_CONT, tid, NULL, NULL);
+                continue;
+            }
+
+            if (sig == SIGSTOP) {
+                ptrace(PTRACE_CONT, tid, NULL, NULL);
+                continue;
+            }
+
+            if (sig == SIGSEGV) {
+                struct user_regs_struct regs;
+                if (ptrace(PTRACE_GETREGS, tid, NULL, &regs) == 0) {
+                    bool is_magic =
+                        regs.rip >= MAGIC_BASE &&
+                        regs.rip < MAGIC_BASE + (uint64_t)nslots * MAGIC_STRIDE;
+                    if (is_magic) {
+                        handle_call_stop(tid, &regs);
+                        continue;
+                    }
+                    if (regs.rip >= MAGIC_RET_BASE &&
+                        regs.rip < MAGIC_RET_BASE + (uint64_t)MAX_PENDING * MAGIC_STRIDE) {
+                        handle_return_stop(tid, &regs);
+                        continue;
+                    }
+                }
+                ptrace(PTRACE_CONT, tid, NULL, (void *)(long)sig);
+                continue;
+            }
+            ptrace(PTRACE_CONT, tid, NULL,
+                   sig == SIGTRAP ? NULL : (void *)(long)sig);
+        }
+
+        for (int t = 0; t < nthreads; t++)
+            kill(threads[t], SIGSTOP);
+        int st2;
+        int stopped = 0;
+        for (int t = 0; t < nthreads; t++)
+            if (waitpid(threads[t], &st2, __WALL) == threads[t] && WIFSTOPPED(st2))
+                stopped++;
+        if (stopped)
+            restore_and_detach(target_pid);
+
+        printf("%s: %lu call%s intercepted\n", symbol,
+               (unsigned long)call_count, call_count == 1 ? "" : "s");
+        return 0;
+    }
+
     if (argc != 3) {
-        fprintf(stderr, "Usage: %s <pid> <symbol>\n", argv[0]);
-        fprintf(stderr, "Attaches to <pid> and counts calls to <symbol>.\n");
-        fprintf(stderr, "Press Ctrl-C to stop and print the summary.\n");
+        usage(argv[0]);
         return 2;
     }
 
@@ -727,11 +969,8 @@ int main(int argc, char **argv)
 
     for (int i = 0; i < nslots; i++) {
         uint64_t orig = peek(target_pid, slots[i].addr);
-        if (orig == UINT64_MAX) {
-            fprintf(stderr, "symtrace: cannot read GOT slot at %#lx\n",
-                    (unsigned long)slots[i].addr);
+        if (orig == UINT64_MAX)
             continue;
-        }
         slots[i].orig = orig;
         uint64_t magic = MAGIC_BASE + (uint64_t)i * MAGIC_STRIDE;
         if (poke(target_pid, slots[i].addr, magic) < 0)
@@ -766,13 +1005,7 @@ int main(int argc, char **argv)
             break;
         }
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            bool leader = (r == target_pid);
-            bool alive = false;
-            for (int t = 0; t < nthreads; t++)
-                if (threads[t] != r)
-                    alive = true;
-            if (leader || !alive)
-                interrupted = 1;
+            interrupted = 1;
             continue;
         }
         if (!WIFSTOPPED(status))
@@ -783,9 +1016,8 @@ int main(int argc, char **argv)
         if (status >> 16 == PTRACE_EVENT_CLONE) {
             unsigned long newtid;
             if (ptrace(PTRACE_GETEVENTMSG, tid, NULL, &newtid) == 0 &&
-                nthreads < MAX_THREADS && newtid != 0) {
+                nthreads < MAX_THREADS && newtid != 0)
                 threads[nthreads++] = (pid_t)newtid;
-            }
             ptrace(PTRACE_CONT, tid, NULL, NULL);
             continue;
         }
@@ -820,12 +1052,13 @@ int main(int argc, char **argv)
 
     for (int t = 0; t < nthreads; t++)
         kill(threads[t], SIGSTOP);
-    for (int t = 0; t < nthreads; t++) {
-        int status;
-        if (waitpid(-1, &status, __WALL) < 0)
-            break;
-    }
-    restore_and_detach(target_pid);
+    int st2;
+    int stopped = 0;
+    for (int t = 0; t < nthreads; t++)
+        if (waitpid(threads[t], &st2, __WALL) == threads[t] && WIFSTOPPED(st2))
+            stopped++;
+    if (stopped)
+        restore_and_detach(target_pid);
 
     printf("%s: %lu call%s intercepted\n", symbol,
            (unsigned long)call_count, call_count == 1 ? "" : "s");
