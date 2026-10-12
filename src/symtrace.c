@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /*
  * symtrace - attach to a running process by PID and count every call to a
  * function identified by its symbol name.
@@ -25,6 +26,7 @@
  */
 
 #include "elfparse.h"
+#include "prototypes.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -35,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/user.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -63,6 +66,179 @@ static uint64_t real_addr;
 static uint64_t call_count;
 static volatile sig_atomic_t interrupted;
 static pid_t target_pid;
+static const char *traced_symbol;
+static const enum arg_type *proto_args;
+
+static bool read_mem(pid_t pid, uint64_t addr, void *buf, size_t len)
+{
+    size_t done = 0;
+    while (done < len) {
+        size_t chunk = len - done;
+        size_t align = addr % sizeof(long);
+        if (align || chunk < sizeof(long)) {
+            errno = 0;
+            long word = ptrace(PTRACE_PEEKDATA, pid, (void *)(addr - align), NULL);
+            if (errno)
+                return false;
+            size_t n = sizeof(long) - align;
+            if (n > chunk)
+                n = chunk;
+            memcpy((char *)buf + done, (char *)&word + align, n);
+            done += n;
+            addr += n;
+            continue;
+        }
+        size_t nwords = chunk / sizeof(long);
+        for (size_t i = 0; i < nwords; i++) {
+            errno = 0;
+            long word = ptrace(PTRACE_PEEKDATA, pid, (void *)(addr + i * sizeof(long)), NULL);
+            if (errno)
+                return false;
+            memcpy((char *)buf + done + i * sizeof(long), &word, sizeof(long));
+        }
+        done += nwords * sizeof(long);
+        addr += nwords * sizeof(long);
+    }
+    return true;
+}
+
+static bool read_cstring(pid_t pid, uint64_t addr, char *buf, size_t bufsz)
+{
+    if (addr == 0 || addr == UINT64_MAX) {
+        buf[0] = '\0';
+        return addr != 0;
+    }
+    size_t total = 0;
+    while (total < bufsz - 1) {
+        size_t chunk = bufsz - 1 - total;
+        if (chunk > 64)
+            chunk = 64;
+        if (!read_mem(pid, addr + total, buf + total, chunk)) {
+            buf[total] = '\0';
+            return total > 0;
+        }
+        for (size_t i = 0; i < chunk; i++) {
+            if (buf[total + i] == '\0')
+                return true;
+        }
+        total += chunk;
+    }
+    buf[bufsz - 1] = '\0';
+    return true;
+}
+
+static void print_escaped(const char *s)
+{
+    putchar('"');
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\')
+            printf("\\%c", c);
+        else if (c >= 0x20 && c < 0x7f)
+            putchar(c);
+        else
+            printf("\\x%02x", c);
+    }
+    putchar('"');
+}
+
+static void print_call_args(pid_t pid, const struct user_regs_struct *regs)
+{
+    uint64_t int_args[6] = {
+        regs->rdi, regs->rsi, regs->rdx, regs->rcx, regs->r8, regs->r9
+    };
+    unsigned long long sse_args[8] = { 0 };
+    struct user_fpregs_struct fp;
+    if (ptrace(PTRACE_GETFPREGS, pid, NULL, &fp) == 0) {
+        memcpy(sse_args, fp.xmm_space, sizeof(sse_args));
+    }
+
+    int int_idx = 0;
+    int sse_idx = 0;
+    int stack_idx = 0;
+
+    printf("%s(", traced_symbol);
+    if (!proto_args) {
+        printf("rdi=%#llx rsi=%#llx rdx=%#llx rcx=%#llx r8=%#llx r9=%#llx",
+               (unsigned long long)int_args[0], (unsigned long long)int_args[1],
+               (unsigned long long)int_args[2], (unsigned long long)int_args[3],
+               (unsigned long long)int_args[4], (unsigned long long)int_args[5]);
+        printf(")\n");
+        return;
+    }
+
+    bool first = true;
+    for (int a = 0; proto_args[a] != TYPE_END; a++) {
+        if (!first)
+            printf(", ");
+        first = false;
+
+        enum arg_type t = proto_args[a];
+        uint64_t v = 0;
+        double d = 0;
+        bool is_sse = false;
+
+        if (t == TYPE_FLOAT || t == TYPE_DOUBLE) {
+            if (sse_idx < 8) {
+                unsigned long long raw = sse_args[sse_idx];
+                if (t == TYPE_DOUBLE) {
+                    memcpy(&d, &raw, sizeof(d));
+                } else {
+                    float f;
+                    memcpy(&f, &raw, sizeof(f));
+                    d = (double)f;
+                }
+                is_sse = true;
+            }
+            sse_idx++;
+        } else {
+            if (int_idx < 6) {
+                v = int_args[int_idx];
+            } else {
+                uint64_t sp = regs->rsp + 8 + (uint64_t)stack_idx * 8;
+                read_mem(pid, sp, &v, sizeof(v));
+                stack_idx++;
+            }
+            int_idx++;
+        }
+
+        switch (t) {
+        case TYPE_INTEGER:
+            printf("%lld", (long long)(int64_t)v);
+            break;
+        case TYPE_UNSIGNED:
+            printf("%lu", (unsigned long)v);
+            break;
+        case TYPE_CHAR:
+            printf("'%c'", (char)v);
+            break;
+        case TYPE_POINTER:
+            printf("%#lx", (unsigned long)v);
+            break;
+        case TYPE_STRING: {
+            char buf[65];
+            if (read_cstring(pid, v, buf, sizeof(buf)))
+                print_escaped(buf);
+            else if (v == 0)
+                printf("NULL");
+            else
+                printf("%#lx", (unsigned long)v);
+            break;
+        }
+        case TYPE_DOUBLE:
+        case TYPE_FLOAT:
+            if (is_sse)
+                printf("%g", d);
+            else
+                printf("<?>");
+            break;
+        default:
+            printf("<?>");
+            break;
+        }
+    }
+    printf(")\n");
+}
 
 static void die(const char *fmt, ...)
 {
@@ -275,6 +451,8 @@ int main(int argc, char **argv)
 
     target_pid = (pid_t)atoi(argv[1]);
     const char *symbol = argv[2];
+    traced_symbol = symbol;
+    proto_args = proto_lookup(symbol);
     if (target_pid <= 0)
         die("symtrace: invalid pid '%s'", argv[1]);
 
@@ -368,6 +546,8 @@ int main(int argc, char **argv)
                 }
                 if (is_magic) {
                     call_count++;
+                    print_call_args(target_pid, &regs);
+                    fflush(stdout);
                     regs.rip = real_addr;
                     ptrace(PTRACE_SETREGS, target_pid, NULL, &regs);
                     ptrace(PTRACE_CONT, target_pid, NULL, NULL);

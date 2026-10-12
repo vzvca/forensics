@@ -153,6 +153,13 @@ wait "$VICTIM_PID" 2>/dev/null
 VICTIM_PID=""
 
 count="$(sed -n 's/^fopen: \([0-9]*\) call.*$/\1/p' "$TMP/trace.out" | tr -d '\r')"
+if grep -q 'fopen("/etc/hostname", "r")' "$TMP/trace.out"; then
+    echo "ok: symtrace decoded fopen arguments"
+else
+    echo "FAIL: symtrace did not decode fopen arguments"
+    cat "$TMP/trace.out"
+    fail=1
+fi
 # victim calls fopen once per second after the first; tracer attached at ~1s,
 # traced for ~3s so expect 2-3 calls. Accept 1..4 to stay robust.
 if [ -n "$count" ] && [ "$count" -ge 1 ] && [ "$count" -le 4 ]; then

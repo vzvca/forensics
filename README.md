@@ -79,9 +79,34 @@ Press Ctrl-C to stop tracing; the summary is printed:
 ```
 $ symtrace 12345 fopen
 symtrace: tracing 'fopen' in pid 12345 (1 GOT slot) - press Ctrl-C to stop
+fopen("/etc/hostname", "r")
+fopen("/var/log/syslog", "a")
 ^C
-fopen: 3 calls intercepted
+fopen: 2 calls intercepted
 ```
+
+### Argument display
+
+At each SIGSEGV stop the registers hold exactly the state at function
+entry (the `call` has pushed the return address; only RIP is rewritten),
+so arguments are decoded following the System V AMD64 ABI: INTEGER-class
+arguments come from `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` then the stack
+(`rsp+8`, `rsp+16`, ...), SSE-class arguments from `xmm0`..`xmm7`.
+Strings are read from the target with ptrace and printed escaped and
+truncated to 64 bytes.
+
+Prototypes are currently hard-coded in `src/prototypes.h` (malloc, the
+stdio family, string functions, sockets, pthreads, ...). For functions
+with a known prototype the arguments are printed decoded; otherwise the
+six INTEGER registers are dumped raw:
+
+```
+malloc(1024)
+read(3, 0x7f00a1b2c3d0, 4096)
+somefunc(rdi=0x1 rsi=0x7ffd0000 rdx=0x0 rcx=0x0 r8=0x0 r9=0x7f00...)
+```
+
+Later versions will get prototypes from DWARF or user declarations.
 
 ### How it works (GOT hijacking, no code injection)
 
@@ -103,9 +128,20 @@ fopen: 3 calls intercepted
 6. On exit, the original GOT values are restored, then the target is
    detached.
 
+### SIGSEGV handlers in the target
+
+The magic addresses are unmapped on purpose: each call faults. A ptrace
+tracer sees every signal **before** it is delivered to the traced process,
+so symtrace intercepts the SIGSEGV, rewrites RIP to the real function and
+resumes; a SIGSEGV handler installed by the target (sigaction) is never
+invoked for these faults. Genuine segmentation faults are forwarded
+untouched with the signal delivered, so the target behaves exactly as if
+symtrace was not there.
+
 ### Limitations
 
-- x86_64 targets only.
+- x86_64 targets only, SysV C ABI only for now (variadic functions,
+  struct returns and by-value structs need a prototype description).
 - Only calls that cross a PLT/GOT are seen: calls made *internally* within
   the defining library (e.g. libc calling its own `fopen` internally) do not
   go through a GOT slot and are not counted.
