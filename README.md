@@ -24,6 +24,17 @@ $ symfind /bin/grep pcre2_compile_8
 make
 ```
 
+### Test
+
+```
+make test
+```
+
+The suite builds fixtures on the fly (a shared library and an executable
+that both export symbols) and checks the three cases: symbol defined in the
+analyzed binary itself, symbol defined in a dependency, and symbol absent
+from the whole closure.
+
 ### Usage
 
 ```

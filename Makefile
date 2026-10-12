@@ -14,4 +14,7 @@ clean:
 install: $(BIN)
 	install -D -m 755 $(BIN) $(DESTDIR)/usr/local/bin/$(BIN)
 
-.PHONY: all clean install
+test: $(BIN)
+	./tests/run.sh
+
+.PHONY: all clean install test
