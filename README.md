@@ -200,6 +200,23 @@ symtrace was not there.
 - Each module in the process has its own GOT; slots are patched in every
   mapped module that imports the symbol.
 
+## dwproto
+
+`dwproto` extracts function prototypes from DWARF debug information and
+prints them in the exact textual shape of `src/prototypes.h` entries, so
+its output can be pasted straight into the hard-coded table:
+
+```
+$ dwproto ./libtclbig.so Tcl_CreateObjCommand2
+    { "Tcl_CreateObjCommand2", RET_POINTER, { TYPE_POINTER, TYPE_STRING, TYPE_POINTER, TYPE_POINTER, TYPE_POINTER, TYPE_END } },   /* Tcl_CreateObjCommand2(ptr, char*, ptr, ptr, ptr) */
+```
+
+Without function names it lists every function found in the debug info
+of the file; if the file is stripped it follows `.gnu_debuglink` (same
+directory, `.debug/`, `/usr/lib/debug/...`) automatically. It is also
+the diagnostic tool of choice when symtrace falls back to raw register
+dumping: if dwproto prints `not found`, symtrace cannot decode either.
+
 ## Build / Test
 
 ```

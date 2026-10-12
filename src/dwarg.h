@@ -20,4 +20,13 @@ bool dwarf_func_prototype(const char *elf_path, const char *func_name,
 
 char *dwarf_debuglink(const char *elf_path, uint32_t *crc);
 
+/* Callback form of dwarf_func_prototype: iterate over every external
+ * subprogram that has a name. Early return false stops the walk. */
+typedef bool (*dwarf_proto_cb)(const char *name, const enum arg_type args[8],
+                              enum ret_type ret, const char *pretty,
+                              void *user);
+
+bool dwarf_list_prototypes(const char *elf_path, dwarf_proto_cb cb,
+                           void *user);
+
 #endif

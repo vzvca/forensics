@@ -442,9 +442,8 @@ char *dwarf_debuglink(const char *elf_path, uint32_t *crc)
     return res;
 }
 
-bool dwarf_func_prototype(const char *elf_path, const char *func_name,
-                          enum arg_type args[8], enum ret_type *ret,
-                          char pretty[256])
+static bool walk_prototypes(const char *elf_path, const char *want_name,
+                            dwarf_proto_cb cb, void *user)
 {
     struct dw_file f;
     if (!dw_open(&f, elf_path)) {
@@ -485,7 +484,7 @@ bool dwarf_func_prototype(const char *elf_path, const char *func_name,
         uint64_t cu_end_off = cu_end;
 
         int depth = 0;
-        while (cur < p && !found) {
+        while (cur < p && (!found || !want_name)) {
             struct abbrev ab;
             uint64_t code;
             {
@@ -524,10 +523,12 @@ bool dwarf_func_prototype(const char *elf_path, const char *func_name,
             }
             (void)has_children;
 
-            if (is_subprogram && name && strcmp(name, func_name) == 0) {
+            if (is_subprogram && name &&
+                (!want_name || strcmp(name, want_name) == 0)) {
                 int na = 0;
-                memset(args, 0, 8 * sizeof(enum arg_type));
-                *ret = type_ref
+                enum arg_type args[8];
+                enum ret_type ret_here =
+                    type_ref
                     ? arg_to_ret(classify_type(&f, die_start_off, abbrev_off,
                                                type_ref, cu_end_off, 0))
                     : RET_NONE;
@@ -594,10 +595,11 @@ bool dwarf_func_prototype(const char *elf_path, const char *func_name,
                     args[i] = TYPE_END;
                 args[na < 8 ? na : 7] = TYPE_END;
 
-                if (pretty) {
+                char pretty[256];
+                {
                     size_t pos = 0;
-                    pos += (size_t)snprintf(pretty + pos, 256 - pos,
-                                             "%s(", func_name);
+                    pos += (size_t)snprintf(pretty + pos, sizeof(pretty) - pos,
+                                             "%s(", name);
                     for (int i = 0; i < na && args[i] != TYPE_END; i++) {
                         const char *tn =
                             args[i] == TYPE_STRING    ? "char*" :
@@ -607,13 +609,21 @@ bool dwarf_func_prototype(const char *elf_path, const char *func_name,
                             args[i] == TYPE_DOUBLE    ? "double" :
                             args[i] == TYPE_FLOAT     ? "float" :
                             args[i] == TYPE_CHAR      ? "char" : "?";
-                        pos += (size_t)snprintf(pretty + pos, 256 - pos,
+                        pos += (size_t)snprintf(pretty + pos, sizeof(pretty) - pos,
                                                 "%s%s", i ? ", " : "", tn);
                     }
-                    snprintf(pretty + pos, 256 - pos, ")");
+                    snprintf(pretty + pos, sizeof(pretty) - pos, ")");
                 }
-                found = true;
-                break;
+
+                if (cb) {
+                    found = true;
+                    if (!cb(name, args, ret_here, pretty, user))
+                        break;
+                }
+                if (want_name) {
+                    found = true;
+                    break;
+                }
             }
 
         }
@@ -622,4 +632,44 @@ bool dwarf_func_prototype(const char *elf_path, const char *func_name,
 
     dw_close(&f);
     return found;
+}
+
+struct proto_hit {
+    enum arg_type args[8];
+    enum ret_type ret;
+    char pretty[256];
+};
+
+static bool fill_hit_cb(const char *name, const enum arg_type args[8],
+                       enum ret_type ret, const char *pretty, void *user)
+{
+    (void)name;
+    struct proto_hit *hit = user;
+    memcpy(hit->args, args, sizeof(hit->args));
+    hit->ret = ret;
+    memcpy(hit->pretty, pretty, sizeof(hit->pretty));
+    return true; /* keep walking not needed: name mode stops anyway */
+}
+
+bool dwarf_func_prototype(const char *elf_path, const char *func_name,
+                          enum arg_type args_out[8], enum ret_type *ret_out,
+                          char pretty_out[256])
+{
+    struct proto_hit hit = { { TYPE_END }, RET_NONE, "" };
+
+    bool ok = walk_prototypes(elf_path, func_name, fill_hit_cb, &hit);
+    if (!ok)
+        return false;
+    if (args_out)
+        memcpy(args_out, hit.args, sizeof(hit.args));
+    if (ret_out)
+        *ret_out = hit.ret;
+    if (pretty_out)
+        memcpy(pretty_out, hit.pretty, sizeof(hit.pretty));
+    return true;
+}
+
+bool dwarf_list_prototypes(const char *elf_path, dwarf_proto_cb cb, void *user)
+{
+    return walk_prototypes(elf_path, NULL, cb, user);
 }

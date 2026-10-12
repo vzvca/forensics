@@ -291,6 +291,31 @@ else
     fail=1
 fi
 
+
+# ---------- dwproto ----------
+
+if [ -x "$ROOT/dwproto" ]; then
+    "$ROOT/dwproto" "$TMP/libgreet.so" greet > "$TMP/dwproto.out" 2>&1
+    if grep -q '{ "greet", RET_INT, { TYPE_STRING, TYPE_INTEGER, TYPE_END } }' \
+       "$TMP/dwproto.out"; then
+        echo "ok: dwproto extracted prototype in prototypes.h format"
+    else
+        echo "FAIL: dwproto output"
+        cat "$TMP/dwproto.out"
+        fail=1
+    fi
+
+    "$ROOT/dwproto" "$TMP/libgreet.so" > "$TMP/dwproto2.out" 2>&1
+    if grep -q '"greet"' "$TMP/dwproto2.out" && \
+       grep -q '"printf"' "$TMP/dwproto2.out"; then
+        echo "ok: dwproto lists all functions without names"
+    else
+        echo "FAIL: dwproto list mode"
+        cat "$TMP/dwproto2.out"
+        fail=1
+    fi
+fi
+
 # ---------- symtrace (attach mode) ----------
 
 cat > "$TMP/victim.c" <<'EOF'
