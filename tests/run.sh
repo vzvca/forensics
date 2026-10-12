@@ -316,6 +316,32 @@ if [ -x "$ROOT/dwproto" ]; then
     fi
 fi
 
+
+# ---------- dwproto (late compilation unit, CU-relative refs) ----------
+
+for i in 1 2 3 4 5 6 7 8; do
+    echo "int filler$i(int x) { return x + $i; }" > "$TMP/fill$i.c"
+done
+cat > "$TMP/late.c" <<'LATEEOF'
+#include <stdio.h>
+typedef const char *NamePtr;
+int RealApi(NamePtr s, int n) { printf("%s %d\n", s, n); return n; }
+LATEEOF
+
+gcc -gdwarf-4 -g -O0 -shared -fPIC -o "$TMP/liblate.so" \
+    "$TMP"/fill*.c "$TMP/late.c" \
+    || { echo "FAIL: build liblate"; exit 1; }
+
+"$ROOT/dwproto" "$TMP/liblate.so" RealApi > "$TMP/late.out" 2>&1
+if grep -q '{ "RealApi", RET_INT, { TYPE_STRING, TYPE_INTEGER, TYPE_END } }' \
+   "$TMP/late.out"; then
+    echo "ok: dwproto resolved CU-relative type refs in a late CU"
+else
+    echo "FAIL: late-CU prototype (all args degrade to ptr)"
+    cat "$TMP/late.out"
+    fail=1
+fi
+
 # ---------- symtrace (attach mode) ----------
 
 cat > "$TMP/victim.c" <<'EOF'

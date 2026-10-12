@@ -329,8 +329,9 @@ struct die_iter {
 };
 
 static enum arg_type classify_type(struct dw_file *f, uint64_t die_start,
-                                   uint64_t abbrev_off, uint64_t type_off,
-                                   uint64_t cu_end, int depth);
+                                   uint64_t abbrev_off, uint64_t cu_base,
+                                   uint64_t type_off, uint64_t cu_end,
+                                   int depth);
 
 #define DW_MAX_DEPTH 64
 
@@ -409,7 +410,7 @@ static const unsigned char *die_at(struct dw_file *f, uint64_t die_start,
 
 static enum arg_type die_classify(struct dw_file *f, const unsigned char *die,
                                   uint64_t die_start, uint64_t abbrev_off,
-                                  uint64_t cu_end, int depth)
+                                  uint64_t cu_base, uint64_t cu_end, int depth)
 {
     const unsigned char *p = die;
     uint64_t code = rd_leb(&p, false);
@@ -455,7 +456,7 @@ static enum arg_type die_classify(struct dw_file *f, const unsigned char *die,
         return base_to_arg(enc, bytes);
     case DW_TAG_pointer_type: {
         enum arg_type pt = type_ref
-            ? classify_type(f, die_start, abbrev_off, type_ref, cu_end, depth + 1)
+            ? classify_type(f, die_start, abbrev_off, cu_base, type_ref, cu_end, depth + 1)
             : TYPE_POINTER;
         return pt == TYPE_CHAR ? TYPE_STRING : TYPE_POINTER;
     }
@@ -464,7 +465,7 @@ static enum arg_type die_classify(struct dw_file *f, const unsigned char *die,
     case DW_TAG_volatile_type:
     case DW_TAG_restrict_type:
         return type_ref
-            ? classify_type(f, die_start, abbrev_off, type_ref, cu_end, depth + 1)
+            ? classify_type(f, die_start, abbrev_off, cu_base, type_ref, cu_end, depth + 1)
             : TYPE_POINTER;
     default:
         return TYPE_POINTER;
@@ -472,33 +473,45 @@ static enum arg_type die_classify(struct dw_file *f, const unsigned char *die,
 }
 
 static enum arg_type classify_type(struct dw_file *f, uint64_t die_start,
-                                   uint64_t abbrev_off, uint64_t type_off,
-                                   uint64_t cu_end, int depth)
+                                   uint64_t abbrev_off, uint64_t cu_base,
+                                   uint64_t type_off, uint64_t cu_end,
+                                   int depth)
 {
-    /* if the target lives in another CU, switch to that CU's context
-     * (its die range and abbrev table) for the whole remaining chain */
-    if (type_off >= cu_end && type_off < f->info_size) {
+    /* References read via DW_FORM_ref1/2/4/udata are CU-relative: the
+     * base is the start of the CU header. Callers that already added
+     * the base (or DW_FORM_ref_addr, absolute) pass an offset that
+     * falls outside the current CU - keep it as is then. */
+    uint64_t target = type_off;
+    if (type_off < cu_end || type_off >= f->info_size)
+        target = cu_base + type_off;
+
+    if (target >= cu_end && target < f->info_size) {
+        /* absolute reference into another CU: switch to its context
+         * for the whole remaining chain */
         for (int i = 0; i < f->ncus; i++) {
-            if (type_off < f->cus[i].cu_end) {
+            if (target < f->cus[i].cu_end) {
                 die_start = f->cus[i].die_start;
                 abbrev_off = f->cus[i].abbrev_off;
+                cu_base = f->cus[i].die_start - 12;
                 cu_end = f->cus[i].cu_end;
                 break;
             }
         }
     }
+
     if (getenv("DWARG_DEBUG"))
-        fprintf(stderr, "classify_type: following ref %#lx (cu range [%#lx,%#lx))\n",
-                (unsigned long)type_off, (unsigned long)die_start,
-                (unsigned long)cu_end);
-    const unsigned char *die = die_at(f, die_start, abbrev_off, type_off, cu_end);
+        fprintf(stderr, "classify_type: ref %#lx -> %#lx (cu range [%#lx,%#lx))\n",
+                (unsigned long)type_off, (unsigned long)target,
+                (unsigned long)die_start, (unsigned long)cu_end);
+
+    const unsigned char *die = die_at(f, die_start, abbrev_off, target, cu_end);
     if (!die) {
         if (getenv("DWARG_DEBUG"))
-            fprintf(stderr, "classify_type: DEAD REF %#lx\n",
-                    (unsigned long)type_off);
+            fprintf(stderr, "classify_type: DEAD REF %#lx (target %#lx)\n",
+                    (unsigned long)type_off, (unsigned long)target);
         return TYPE_POINTER;
     }
-    return die_classify(f, die, die_start, abbrev_off, cu_end, depth);
+    return die_classify(f, die, die_start, abbrev_off, cu_base, cu_end, depth);
 }
 
 static enum ret_type arg_to_ret(enum arg_type t)
@@ -604,6 +617,7 @@ static bool walk_prototypes(const char *elf_path, const char *want_name,
         const unsigned char *cur = h;
         uint64_t die_start_off = (uint64_t)(h - f.info);
         uint64_t cu_end_off = cu_end;
+        uint64_t cu_base_off = (uint64_t)(cu - f.info);
 
         int depth = 0;
         while (cur < p && (!found || !want_name)) {
@@ -652,7 +666,8 @@ static bool walk_prototypes(const char *elf_path, const char *want_name,
                 enum ret_type ret_here =
                     type_ref
                     ? arg_to_ret(classify_type(&f, die_start_off, abbrev_off,
-                                               type_ref, cu_end_off, 0))
+                                               cu_base_off, type_ref,
+                                               cu_end_off, 0))
                     : RET_NONE;
 
                 /* Children: formal_parameter / unspecified_parameters. */
@@ -685,8 +700,8 @@ static bool walk_prototypes(const char *elf_path, const char *want_name,
                         c = q;
                         if (cab.tag == DW_TAG_formal_parameter && cref) {
                             args[na++] = classify_type(&f, die_start_off,
-                                                       abbrev_off, cref,
-                                                       cu_end_off, 0);
+                                                       abbrev_off, cu_base_off,
+                                                       cref, cu_end_off, 0);
                         } else if (cab.tag == DW_TAG_unspecified_parameters) {
                             break; /* variadic: stop decoding */
                         }
