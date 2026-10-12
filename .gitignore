@@ -1,4 +1,7 @@
 symfind
 symtrace
+dwproto
 elfparse.o
 dwarg.o
+example/main
+example/factorial.so
