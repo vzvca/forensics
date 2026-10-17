@@ -26,6 +26,7 @@
  */
 
 #include "elfparse.h"
+#include "common/target.h"
 #include "prototypes.h"
 #include "dwarg.h"
 
@@ -53,10 +54,6 @@
 #define MAX_PENDING 256
 #define ARGBUF_LEN 512
 
-struct module {
-    char path[PATH_MAX];
-    uint64_t base;
-};
 
 struct slot {
     uint64_t addr;
@@ -77,8 +74,7 @@ struct pending_call {
     char args[ARGBUF_LEN];
 };
 
-static struct module modules[MAX_MODULES];
-static int nmodules;
+static struct target tgt;
 static struct slot slots[MAX_SLOTS];
 static int nslots;
 static char symbol_buf[8][64];
@@ -368,64 +364,10 @@ static int poke(pid_t pid, uint64_t addr, uint64_t val)
     return ptrace(PTRACE_POKEDATA, pid, (void *)addr, (void *)val);
 }
 
-static size_t vaddr_off(const struct elf_file *e, uint64_t vaddr)
-{
-    for (int i = 0; i < e->eh64->e_phnum; i++) {
-        Elf64_Phdr *ph =
-            (Elf64_Phdr *)(e->base + e->eh64->e_phoff + i * e->eh64->e_phentsize);
-        if (ph->p_type == PT_LOAD && vaddr >= ph->p_vaddr &&
-            vaddr < ph->p_vaddr + ph->p_filesz)
-            return (size_t)(vaddr - ph->p_vaddr + ph->p_offset);
-    }
-    return 0;
-}
-
 static void load_maps(pid_t pid)
 {
-    char mapsfile[64];
-    snprintf(mapsfile, sizeof(mapsfile), "/proc/%d/maps", pid);
-    FILE *f = fopen(mapsfile, "r");
-    if (!f)
-        die("symtrace: cannot open %s: %s", mapsfile, strerror(errno));
-
-    char line[PATH_MAX + 128];
-    while (fgets(line, sizeof(line), f)) {
-        uint64_t start, end, off;
-        char perms[8];
-        char path[PATH_MAX];
-        path[0] = '\0';
-        int n = sscanf(line, "%lx-%lx %7s %lx %*s %*s %4095s",
-                       &start, &end, perms, &off, path);
-        (void)end;
-        if (n < 4)
-            continue;
-        if (path[0] != '/')
-            continue;
-        if (off != 0)
-            continue;
-
-        char *bang = strstr(path, " (deleted");
-        if (bang)
-            *bang = '\0';
-
-        int existing = -1;
-        for (int i = 0; i < nmodules; i++)
-            if (strcmp(modules[i].path, path) == 0) {
-                existing = i;
-                break;
-            }
-        if (existing >= 0) {
-            if (start < modules[existing].base)
-                modules[existing].base = start;
-            continue;
-        }
-        if (nmodules >= MAX_MODULES)
-            break;
-        snprintf(modules[nmodules].path, sizeof(modules[0].path), "%s", path);
-        modules[nmodules].base = start;
-        nmodules++;
-    }
-    fclose(f);
+    target_init(&tgt, pid);
+    target_load_maps(&tgt);
 }
 
 static bool is_target_reloc_type(uint64_t type)
@@ -438,57 +380,6 @@ static bool is_target_reloc_type(uint64_t type)
 #endif
 }
 
-static void find_got_slots(const struct elf_file *e, uint64_t base)
-{
-    if (!e->is64)
-        return;
-
-    struct { uint64_t addr; uint64_t size; } tables[2] = {
-        { e->jmprel, e->pltrelsz },
-        { e->rela, e->relasz },
-    };
-
-    for (int t = 0; t < 2; t++) {
-        if (!tables[t].addr || !tables[t].size)
-            continue;
-        size_t off = vaddr_off(e, tables[t].addr);
-        if (!off)
-            continue;
-        size_t entsz = sizeof(Elf64_Rela);
-        size_t count = tables[t].size / entsz;
-        for (size_t i = 0; i < count; i++) {
-            Elf64_Rela *r = (Elf64_Rela *)(e->base + off + i * entsz);
-            uint64_t symidx = ELF64_R_SYM(r->r_info);
-            uint64_t type = ELF64_R_TYPE(r->r_info);
-            if (!is_target_reloc_type(type))
-                continue;
-            const char *name = elf_sym_name(e, symidx);
-            if (!name)
-                continue;
-            const char *matched = NULL;
-            for (int k = 0; k < nsymbols; k++)
-                if (strcmp(name, symbols[k]) == 0) {
-                    matched = symbols[k];
-                    break;
-                }
-            if (!matched)
-                continue;
-            uint64_t slotaddr = base + r->r_offset;
-            bool dup = false;
-            for (int s = 0; s < nslots; s++)
-                if (slots[s].addr == slotaddr) {
-                    dup = true;
-                    break;
-                }
-            if (dup || nslots >= MAX_SLOTS)
-                continue;
-            memset(&slots[nslots], 0, sizeof(slots[nslots]));
-            slots[nslots].addr = slotaddr;
-            slots[nslots].symbol = matched;
-            nslots++;
-        }
-    }
-}
 
 static char defining_module[PATH_MAX];
 
@@ -496,54 +387,14 @@ static bool setup_slots(pid_t pid, bool fatal);
 
 static uint64_t resolve_real_addr(pid_t pid, const char *symbol)
 {
-    for (int i = 0; i < nmodules; i++) {
-        struct elf_file e;
-        if (!elf_load_file(&e, modules[i].path))
-            continue;
-        for (size_t s = 0; s < elf_sym_count(&e); s++) {
-            const char *n = elf_sym_name(&e, s);
-            if (n && strcmp(n, symbol) == 0 && elf_sym_defined(&e, s)) {
-                uint64_t v = elf_sym_value(&e, s);
-                elf_unload(&e);
-                if (v) {
-                    snprintf(defining_module, sizeof(defining_module), "%s",
-                             modules[i].path);
-                    return modules[i].base + v;
-                }
-                return 0;
-            }
-        }
-        elf_unload(&e);
-    }
-    for (int s = 0; s < nslots; s++) {
-        if (slots[s].orig)
-            continue; /* already patched with a magic address */
-        uint64_t v = peek(pid, slots[s].addr);
-        if (v != UINT64_MAX && v && (v & 0xfff) != 0x000)
-            return v;
-    }
-    return 0;
+    (void)pid;
+    return target_resolve_addr(&tgt, symbol, defining_module);
 }
 
 static bool range_mapped(pid_t pid, uint64_t addr)
 {
-    char mapsfile[64];
-    snprintf(mapsfile, sizeof(mapsfile), "/proc/%d/maps", pid);
-    FILE *f = fopen(mapsfile, "r");
-    if (!f)
-        return true;
-    char line[512];
-    bool mapped = false;
-    while (fgets(line, sizeof(line), f)) {
-        uint64_t start, end;
-        if (sscanf(line, "%lx-%lx", &start, &end) == 2 &&
-            addr >= start && addr < end) {
-            mapped = true;
-            break;
-        }
-    }
-    fclose(f);
-    return mapped;
+    (void)pid;
+    return target_range_mapped(&tgt, addr);
 }
 
 #define MAX_THREADS 256
@@ -826,9 +677,9 @@ static uint64_t entry_breakpoint_addr(pid_t pid)
     uint64_t entry = e.eh64->e_entry;
     elf_unload(&e);
 
-    for (int i = 0; i < nmodules; i++)
-        if (strcmp(modules[i].path, real) == 0)
-            return modules[i].base + entry;
+    for (int i = 0; i < tgt.nmodules; i++)
+        if (strcmp(tgt.modules[i].path, real) == 0)
+            return tgt.modules[i].base + entry;
     return 0;
 }
 
@@ -868,7 +719,6 @@ static void trace_child_from_start(pid_t pid)
 
     attach_all_threads(pid);
 
-    nmodules = 0;
     load_maps(pid);
     setup_slots(pid, true);
 }
@@ -879,12 +729,23 @@ static void trace_child_from_start(pid_t pid)
  * be set up. */
 static bool setup_slots(pid_t pid, bool fatal)
 {
-    for (int i = 0; i < nmodules; i++) {
-        struct elf_file e;
-        if (!elf_load_file(&e, modules[i].path))
-            continue;
-        find_got_slots(&e, modules[i].base);
-        elf_unload(&e);
+    for (int k = 0; k < nsymbols; k++) {
+        struct target_slot tslots[MAX_SLOTS];
+        int n = target_find_got_slots(&tgt, symbols[k], tslots, MAX_SLOTS);
+        for (int i = 0; i < n; i++) {
+            bool dup = false;
+            for (int s = 0; s < nslots; s++)
+                if (slots[s].addr == tslots[i].addr) {
+                    dup = true;
+                    break;
+                }
+            if (dup || nslots >= MAX_SLOTS)
+                continue;
+            memset(&slots[nslots], 0, sizeof(slots[nslots]));
+            slots[nslots].addr = tslots[i].addr;
+            slots[nslots].symbol = symbols[k];
+            nslots++;
+        }
     }
 
     if (nslots == 0) {

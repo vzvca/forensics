@@ -397,6 +397,130 @@ else
     fail=1
 fi
 
+# ---------- symhijack (attach mode) ----------
+
+cat > "$TMP/hjvictim.c" <<'HJVICTIM'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(void)
+{
+    for (int i = 0; i < 6; i++) {
+        printf("HOME=%s\n", getenv("HOME"));
+        fflush(stdout);
+        sleep(1);
+    }
+    return 0;
+}
+HJVICTIM
+
+cat > "$TMP/hjrepl.c" <<'HJREPL'
+#include <stdlib.h>
+char *getenv(const char *name)
+{
+    (void)name;
+    return "/hijacked";
+}
+HJREPL
+
+gcc -O0 -o "$TMP/hjvictim" "$TMP/hjvictim.c" \
+    || { echo "FAIL: build hjvictim"; exit 1; }
+gcc -O0 -shared -fPIC -o "$TMP/hjrepl.so" "$TMP/hjrepl.c" \
+    || { echo "FAIL: build hjrepl.so"; exit 1; }
+
+"$TMP/hjvictim" > "$TMP/hj.out" 2>&1 &
+HJ_PID=$!
+sleep 2
+"$ROOT/symhijack" "$HJ_PID" "$TMP/hjrepl.so" getenv > "$TMP/hj.trace.out" 2>&1
+rc=$?
+sleep 3
+kill "$HJ_PID" 2>/dev/null
+wait "$HJ_PID" 2>/dev/null
+
+if [ "$rc" = "0" ] \
+   && grep -q 'GOT slot' "$TMP/hj.trace.out" \
+   && grep -q '/hijacked' "$TMP/hj.out" \
+   && grep -q 'HOME=/home/' "$TMP/hj.out"; then
+    echo "ok: symhijack redirected getenv in a running process"
+else
+    echo "FAIL: symhijack attach mode (rc=$rc)"
+    cat "$TMP/hj.trace.out"
+    cat "$TMP/hj.out"
+    fail=1
+fi
+
+# ---------- symhijack (launch mode, from process start) ----------
+
+"$ROOT/symhijack" -r "$TMP/hjrepl.so" getenv -- "$TMP/hjvictim" \
+    > "$TMP/hj2.out" 2>&1
+rc=$?
+if [ "$rc" = "0" ] \
+   && grep -q 'HOME=/hijacked' "$TMP/hj2.out" \
+   && ! grep -q 'HOME=/home/' "$TMP/hj2.out"; then
+    echo "ok: symhijack launch mode hijacked from process start"
+else
+    echo "FAIL: symhijack launch mode (rc=$rc)"
+    cat "$TMP/hj2.out"
+    fail=1
+fi
+
+# ---------- symhijack (watch mode restores GOT) ----------
+
+cat > "$TMP/hjrepl2.c" <<'HJREPL2'
+#include <stdlib.h>
+char *getenv(const char *name)
+{
+    (void)name;
+    return "/watched";
+}
+HJREPL2
+gcc -O0 -shared -fPIC -o "$TMP/hjrepl2.so" "$TMP/hjrepl2.c" \
+    || { echo "FAIL: build hjrepl2.so"; exit 1; }
+
+"$ROOT/symhijack" -w "$HJ_PID" "$TMP/hjrepl2.so" getenv >/dev/null 2>&1
+rc=$?
+# watch-mode run against a fresh victim
+cat > "$TMP/hjvictim2.c" <<'HJVICTIM2'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(void)
+{
+    for (int i = 0; i < 8; i++) {
+        printf("HOME=%s\n", getenv("HOME"));
+        fflush(stdout);
+        sleep(1);
+    }
+    return 0;
+}
+HJVICTIM2
+gcc -O0 -o "$TMP/hjvictim2" "$TMP/hjvictim2.c" \
+    || { echo "FAIL: build hjvictim2"; exit 1; }
+
+"$TMP/hjvictim2" > "$TMP/hj3.out" 2>&1 &
+HJ2_PID=$!
+sleep 2
+"$ROOT/symhijack" -w "$HJ2_PID" "$TMP/hjrepl2.so" getenv \
+    > "$TMP/hj3.trace.out" 2>&1 &
+WATCH_PID=$!
+sleep 3
+kill -INT "$WATCH_PID"
+wait "$WATCH_PID"
+sleep 1
+kill "$HJ2_PID" 2>/dev/null
+wait "$HJ2_PID" 2>/dev/null
+
+if grep -q '/watched' "$TMP/hj3.out" \
+   && grep -q 'HOME=/home/' "$TMP/hj3.out" \
+   && grep -q 'original GOT values restored' "$TMP/hj3.trace.out"; then
+    echo "ok: symhijack watch mode redirected then restored the GOT"
+else
+    echo "FAIL: symhijack watch mode"
+    cat "$TMP/hj3.trace.out"
+    cat "$TMP/hj3.out"
+    fail=1
+fi
+
 if [ $fail -eq 0 ]; then
     echo "all tests passed"
 else
