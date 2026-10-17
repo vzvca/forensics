@@ -1,0 +1,11 @@
+symfind
+symtrace
+symhijack
+dwproto
+elfparse.o
+dwarg.o
+common_pt.o
+common_target.o
+common_remote.o
+example/main
+example/factorial.so

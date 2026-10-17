@@ -1,0 +1,529 @@
+#!/bin/sh
+# Test suite for symfind and symtrace.
+#
+# symfind: builds a shared library and an -rdynamic executable linking it,
+# then checks exact, glob and regex matching, plus the not-found case.
+#
+# symtrace: builds a victim that calls fopen() in a loop, attaches to it
+# by PID and checks that the call count matches.
+
+set -u
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"; [ -n "${VICTIM_PID:-}" ] && kill "$VICTIM_PID" 2>/dev/null' EXIT
+
+fail=0
+
+check()
+{
+    desc="$1"
+    expected="$2"
+    shift 2
+
+    got="$("$ROOT/symfind" "$@" 2>/dev/null | sort)"
+    if [ "$got" = "$expected" ]; then
+        echo "ok: $desc"
+    else
+        echo "FAIL: $desc"
+        echo "  expected: $expected"
+        echo "  got:      ${got:-<no output>}"
+        fail=1
+    fi
+}
+
+check_rc()
+{
+    desc="$1"
+    expected_rc="$2"
+    shift 2
+
+    "$ROOT/symfind" "$@" >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" = "$expected_rc" ]; then
+        echo "ok: $desc"
+    else
+        echo "FAIL: $desc"
+        echo "  expected rc: $expected_rc"
+        echo "  got rc:      $rc"
+        fail=1
+    fi
+}
+
+make -C "$ROOT" >/dev/null || { echo "FAIL: build"; exit 1; }
+
+# ---------- symfind ----------
+
+cat > "$TMP/dep.c" <<'EOF'
+int dep_only_func(void)
+{
+    return 42;
+}
+
+int dep_wild_func_1(void)
+{
+    return 1;
+}
+
+int dep_wild_func_2(void)
+{
+    return 2;
+}
+EOF
+
+cat > "$TMP/main.c" <<'EOF'
+extern int dep_only_func(void);
+
+int local_only_func(void)
+{
+    return dep_only_func() + 1;
+}
+
+int main(void)
+{
+    return local_only_func();
+}
+EOF
+
+gcc -shared -fPIC -o "$TMP/libtestdep.so" "$TMP/dep.c" || { echo "FAIL: build fixture"; exit 1; }
+gcc -o "$TMP/testbin" "$TMP/main.c" -L"$TMP" -ltestdep -Wl,-rpath,"$TMP" -rdynamic || { echo "FAIL: build fixture"; exit 1; }
+
+check "exact: symbol defined in the binary itself" \
+     "$TMP/testbin: local_only_func" \
+     "$TMP/testbin" local_only_func
+
+check "exact: symbol defined in a dependency" \
+     "$TMP/libtestdep.so: dep_only_func" \
+     "$TMP/testbin" dep_only_func
+
+check "glob: multiple symbols in a dependency" \
+     "$TMP/libtestdep.so: dep_wild_func_1
+$TMP/libtestdep.so: dep_wild_func_2" \
+     -g "$TMP/testbin" 'dep_wild_*'
+
+check "regex: symbol in the binary itself" \
+     "$TMP/testbin: local_only_func" \
+     -r "$TMP/testbin" '^local_[a-z_]+$'
+
+check "regex: symbols in a dependency" \
+     "$TMP/libtestdep.so: dep_only_func
+$TMP/libtestdep.so: dep_wild_func_1
+$TMP/libtestdep.so: dep_wild_func_2" \
+     -r "$TMP/testbin" '^dep_(only|wild)_'
+
+check_rc "missing symbol reported not found" 1 "$TMP/testbin" symbol_that_exists_nowhere
+
+check_rc "invalid regex reported" 2 -r "$TMP/testbin" '['
+
+# ---------- symtrace (launch mode) ----------
+
+cat > "$TMP/spawn.c" <<'SPAWNEOF'
+#include <stdio.h>
+int main(void)
+{
+    FILE *f = fopen("/etc/hostname", "r");
+    if (f)
+        fclose(f);
+    f = fopen("/etc/hostname", "r");
+    if (f)
+        fclose(f);
+    return 0;
+}
+SPAWNEOF
+
+gcc -O0 -o "$TMP/spawn" "$TMP/spawn.c" || { echo "FAIL: build spawn"; exit 1; }
+
+"$ROOT/symtrace" -r fopen -- "$TMP/spawn" > "$TMP/spawn.out" 2>&1
+rc=$?
+if [ "$rc" = "0" ] && grep -q 'fopen("/etc/hostname", "r") = ' "$TMP/spawn.out" \
+   && grep -q '2 calls intercepted' "$TMP/spawn.out"; then
+    echo "ok: symtrace launch mode traced calls from process start"
+else
+    echo "FAIL: symtrace launch mode (rc=$rc)"
+    cat "$TMP/spawn.out"
+    fail=1
+fi
+
+# ---------- symtrace (DWARF prototype) ----------
+
+cat > "$TMP/greetlib.c" <<'GRLIBEOF'
+#include <stdio.h>
+int greet(const char *who, int times)
+{
+    int r = 0;
+    for (int i = 0; i < times; i++)
+        r += printf("hello %s\n", who);
+    return r;
+}
+GRLIBEOF
+
+cat > "$TMP/greetmain.c" <<'GRMAINEOF'
+#include <unistd.h>
+int greet(const char *who, int times);
+int main(void) { greet("world", 1); return 0; }
+GRMAINEOF
+
+gcc -g -O0 -shared -fPIC -o "$TMP/libgreet.so" "$TMP/greetlib.c" \
+    || { echo "FAIL: build greet lib"; exit 1; }
+gcc -g -O0 -o "$TMP/greetmain" "$TMP/greetmain.c" -L"$TMP" -lgreet \
+    -Wl,-rpath,"$TMP" || { echo "FAIL: build greet main"; exit 1; }
+
+# inline debug info
+"$ROOT/symtrace" -r greet -- "$TMP/greetmain" > "$TMP/greet1.out" 2>&1
+if grep -q 'prototype from debug info: greet(char\*, int)' "$TMP/greet1.out" \
+   && grep -q 'greet("world", 1) = ' "$TMP/greet1.out"; then
+    echo "ok: DWARF prototype used (inline debug info)"
+else
+    echo "FAIL: DWARF prototype (inline)"
+    cat "$TMP/greet1.out"
+    fail=1
+fi
+
+# separate debug file via .gnu_debuglink
+objcopy --only-keep-debug "$TMP/libgreet.so" "$TMP/libgreet.so.debug" \
+    && strip -g "$TMP/libgreet.so" \
+    && (cd "$TMP" && objcopy --add-gnu-debuglink=./libgreet.so.debug ./libgreet.so) \
+    || { echo "FAIL: objcopy debuglink"; exit 1; }
+
+"$ROOT/symtrace" -r greet -- "$TMP/greetmain" > "$TMP/greet2.out" 2>&1
+if grep -q 'prototype from debug info: greet(char\*, int)' "$TMP/greet2.out" \
+   && grep -q 'greet("world", 1) = ' "$TMP/greet2.out"; then
+    echo "ok: DWARF prototype used (separate .gnu_debuglink file)"
+else
+    echo "FAIL: DWARF prototype (debuglink)"
+    cat "$TMP/greet2.out"
+    fail=1
+fi
+
+
+# DWARF version compatibility (gcc 10 defaults to DWARF 4)
+gcc -gdwarf-4 -g -O0 -shared -fPIC -o "$TMP/libgreet4.so" "$TMP/greetlib.c" \
+    || { echo "FAIL: build greet lib dwarf4"; exit 1; }
+gcc -gdwarf-4 -g -O0 -o "$TMP/greetmain4" "$TMP/greetmain.c" -L"$TMP" -lgreet4 \
+    -Wl,-rpath,"$TMP" || { echo "FAIL: build greet main dwarf4"; exit 1; }
+
+"$ROOT/symtrace" -r greet -- "$TMP/greetmain4" > "$TMP/greet4.out" 2>&1
+if grep -q 'prototype from debug info: greet(char\*, int)' "$TMP/greet4.out" \
+   && grep -q 'greet("world", 1) = ' "$TMP/greet4.out"; then
+    echo "ok: DWARF 4 prototype (gcc 10 default) decoded"
+else
+    echo "FAIL: DWARF 4 prototype"
+    cat "$TMP/greet4.out"
+    fail=1
+fi
+
+
+# ---------- symtrace (multiple symbols) ----------
+
+cat > "$TMP/multi.c" <<'MULTIEOF'
+#include <stdio.h>
+#include <stdlib.h>
+int main(void)
+{
+    for (int i = 0; i < 2; i++) {
+        void *p = malloc(32);
+        FILE *f = fopen("/etc/hostname", "r");
+        if (f)
+            fclose(f);
+        free(p);
+    }
+    return 0;
+}
+MULTIEOF
+
+gcc -O0 -o "$TMP/multi" "$TMP/multi.c" || { echo "FAIL: build multi"; exit 1; }
+
+"$ROOT/symtrace" -r fopen,malloc -- "$TMP/multi" > "$TMP/multi.out" 2>&1
+rc=$?
+if [ "$rc" = "0" ] && grep -q 'also tracing' "$TMP/multi.out" \
+   && grep -q 'fopen: 2 calls intercepted' "$TMP/multi.out" \
+   && grep -q 'malloc: [2-9] calls intercepted' "$TMP/multi.out" \
+   && grep -q 'fopen("/etc/hostname", "r") = ' "$TMP/multi.out" \
+   && grep -q 'malloc(32) = ' "$TMP/multi.out"; then
+    echo "ok: symtrace traced multiple symbols in one run"
+else
+    echo "FAIL: multi-symbol tracing (rc=$rc)"
+    cat "$TMP/multi.out"
+    fail=1
+fi
+
+
+# ---------- symtrace (long symbol names, multiple) ----------
+
+cat > "$TMP/two.c" <<'TWOEOF'
+#include <stdio.h>
+void Tcl_CreateObjCommand(const char *n) { printf("obj %s\n", n); }
+void Tcl_CreateNamespace(const char *n)  { printf("ns %s\n", n); }
+TWOEOF
+
+cat > "$TMP/twomain.c" <<'TWOMAINEOF'
+#include <unistd.h>
+extern void Tcl_CreateObjCommand(const char *);
+extern void Tcl_CreateNamespace(const char *);
+int main(void)
+{
+    for (int i = 0; i < 2; i++) {
+        Tcl_CreateObjCommand("cmd");
+        Tcl_CreateNamespace("ns");
+    }
+    return 0;
+}
+TWOMAINEOF
+
+gcc -O0 -shared -fPIC -o "$TMP/libtwo.so" "$TMP/two.c" \
+    || { echo "FAIL: build two lib"; exit 1; }
+gcc -O0 -o "$TMP/twomain" "$TMP/twomain.c" -L"$TMP" -ltwo \
+    -Wl,-rpath,"$TMP" || { echo "FAIL: build twomain"; exit 1; }
+
+"$ROOT/symtrace" -r Tcl_CreateObjCommand,Tcl_CreateNamespace -- "$TMP/twomain" \
+    > "$TMP/two.out" 2>&1
+rc=$?
+if [ "$rc" = "0" ] \
+   && grep -q "tracing 'Tcl_CreateObjCommand'" "$TMP/two.out" \
+   && grep -q 'Tcl_CreateObjCommand(' "$TMP/two.out" \
+   && grep -q 'Tcl_CreateNamespace(' "$TMP/two.out" \
+   && grep -q 'Tcl_CreateObjCommand: 2 calls intercepted' "$TMP/two.out" \
+   && grep -q 'Tcl_CreateNamespace: 2 calls intercepted' "$TMP/two.out"; then
+    echo "ok: multiple long-named symbols traced together"
+else
+    echo "FAIL: multiple long-named symbols (rc=$rc)"
+    cat "$TMP/two.out"
+    fail=1
+fi
+
+
+# ---------- dwproto ----------
+
+if [ -x "$ROOT/dwproto" ]; then
+    "$ROOT/dwproto" "$TMP/libgreet.so" greet > "$TMP/dwproto.out" 2>&1
+    if grep -q '{ "greet", RET_INT, { TYPE_STRING, TYPE_INTEGER, TYPE_END } }' \
+       "$TMP/dwproto.out"; then
+        echo "ok: dwproto extracted prototype in prototypes.h format"
+    else
+        echo "FAIL: dwproto output"
+        cat "$TMP/dwproto.out"
+        fail=1
+    fi
+
+    "$ROOT/dwproto" "$TMP/libgreet.so" > "$TMP/dwproto2.out" 2>&1
+    if grep -q '"greet"' "$TMP/dwproto2.out" && \
+       grep -q '"printf"' "$TMP/dwproto2.out"; then
+        echo "ok: dwproto lists all functions without names"
+    else
+        echo "FAIL: dwproto list mode"
+        cat "$TMP/dwproto2.out"
+        fail=1
+    fi
+fi
+
+
+# ---------- dwproto (late compilation unit, CU-relative refs) ----------
+
+for i in 1 2 3 4 5 6 7 8; do
+    echo "int filler$i(int x) { return x + $i; }" > "$TMP/fill$i.c"
+done
+cat > "$TMP/late.c" <<'LATEEOF'
+#include <stdio.h>
+typedef const char *NamePtr;
+int RealApi(NamePtr s, int n) { printf("%s %d\n", s, n); return n; }
+LATEEOF
+
+gcc -gdwarf-4 -g -O0 -shared -fPIC -o "$TMP/liblate.so" \
+    "$TMP"/fill*.c "$TMP/late.c" \
+    || { echo "FAIL: build liblate"; exit 1; }
+
+"$ROOT/dwproto" "$TMP/liblate.so" RealApi > "$TMP/late.out" 2>&1
+if grep -q '{ "RealApi", RET_INT, { TYPE_STRING, TYPE_INTEGER, TYPE_END } }' \
+   "$TMP/late.out"; then
+    echo "ok: dwproto resolved CU-relative type refs in a late CU"
+else
+    echo "FAIL: late-CU prototype (all args degrade to ptr)"
+    cat "$TMP/late.out"
+    fail=1
+fi
+
+# ---------- symtrace (attach mode) ----------
+
+cat > "$TMP/victim.c" <<'EOF'
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void)
+{
+    /* one call before the tracer attaches */
+    FILE *f = fopen("/etc/hostname", "r");
+    if (f)
+        fclose(f);
+    for (int i = 0; i < 10; i++) {
+        sleep(1);
+        f = fopen("/etc/hostname", "r");
+        if (f)
+            fclose(f);
+    }
+    return 0;
+}
+EOF
+
+gcc -O0 -o "$TMP/victim" "$TMP/victim.c" || { echo "FAIL: build victim"; exit 1; }
+
+"$TMP/victim" >/dev/null 2>&1 &
+VICTIM_PID=$!
+sleep 1
+
+"$ROOT/symtrace" "$VICTIM_PID" fopen > "$TMP/trace.out" 2>&1 &
+TRACE_PID=$!
+sleep 3
+kill -INT "$TRACE_PID"
+wait "$TRACE_PID"
+kill "$VICTIM_PID" 2>/dev/null
+wait "$VICTIM_PID" 2>/dev/null
+VICTIM_PID=""
+
+count="$(sed -n 's/^fopen: \([0-9]*\) call.*$/\1/p' "$TMP/trace.out" | tr -d '\r')"
+if grep -q 'fopen("/etc/hostname", "r") = ' "$TMP/trace.out"; then
+    echo "ok: symtrace decoded fopen arguments and return value"
+else
+    echo "FAIL: symtrace did not decode fopen arguments and return value"
+    cat "$TMP/trace.out"
+    fail=1
+fi
+# victim calls fopen once per second after the first; tracer attached at ~1s,
+# traced for ~3s so expect 2-3 calls. Accept 1..4 to stay robust.
+if [ -n "$count" ] && [ "$count" -ge 1 ] && [ "$count" -le 4 ]; then
+    echo "ok: symtrace counted $count fopen calls"
+else
+    echo "FAIL: symtrace call count (got '${count:-none}', expected 1..4)"
+    cat "$TMP/trace.out"
+    fail=1
+fi
+
+# ---------- symhijack (attach mode) ----------
+
+cat > "$TMP/hjvictim.c" <<'HJVICTIM'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(void)
+{
+    for (int i = 0; i < 6; i++) {
+        printf("HOME=%s\n", getenv("HOME"));
+        fflush(stdout);
+        sleep(1);
+    }
+    return 0;
+}
+HJVICTIM
+
+cat > "$TMP/hjrepl.c" <<'HJREPL'
+#include <stdlib.h>
+char *getenv(const char *name)
+{
+    (void)name;
+    return "/hijacked";
+}
+HJREPL
+
+gcc -O0 -o "$TMP/hjvictim" "$TMP/hjvictim.c" \
+    || { echo "FAIL: build hjvictim"; exit 1; }
+gcc -O0 -shared -fPIC -o "$TMP/hjrepl.so" "$TMP/hjrepl.c" \
+    || { echo "FAIL: build hjrepl.so"; exit 1; }
+
+"$TMP/hjvictim" > "$TMP/hj.out" 2>&1 &
+HJ_PID=$!
+sleep 2
+"$ROOT/symhijack" "$HJ_PID" "$TMP/hjrepl.so" getenv > "$TMP/hj.trace.out" 2>&1
+rc=$?
+sleep 3
+kill "$HJ_PID" 2>/dev/null
+wait "$HJ_PID" 2>/dev/null
+
+if [ "$rc" = "0" ] \
+   && grep -q 'GOT slot' "$TMP/hj.trace.out" \
+   && grep -q '/hijacked' "$TMP/hj.out" \
+   && grep -q 'HOME=/home/' "$TMP/hj.out"; then
+    echo "ok: symhijack redirected getenv in a running process"
+else
+    echo "FAIL: symhijack attach mode (rc=$rc)"
+    cat "$TMP/hj.trace.out"
+    cat "$TMP/hj.out"
+    fail=1
+fi
+
+# ---------- symhijack (launch mode, from process start) ----------
+
+"$ROOT/symhijack" -r "$TMP/hjrepl.so" getenv -- "$TMP/hjvictim" \
+    > "$TMP/hj2.out" 2>&1
+rc=$?
+if [ "$rc" = "0" ] \
+   && grep -q 'HOME=/hijacked' "$TMP/hj2.out" \
+   && ! grep -q 'HOME=/home/' "$TMP/hj2.out"; then
+    echo "ok: symhijack launch mode hijacked from process start"
+else
+    echo "FAIL: symhijack launch mode (rc=$rc)"
+    cat "$TMP/hj2.out"
+    fail=1
+fi
+
+# ---------- symhijack (watch mode restores GOT) ----------
+
+cat > "$TMP/hjrepl2.c" <<'HJREPL2'
+#include <stdlib.h>
+char *getenv(const char *name)
+{
+    (void)name;
+    return "/watched";
+}
+HJREPL2
+gcc -O0 -shared -fPIC -o "$TMP/hjrepl2.so" "$TMP/hjrepl2.c" \
+    || { echo "FAIL: build hjrepl2.so"; exit 1; }
+
+"$ROOT/symhijack" -w "$HJ_PID" "$TMP/hjrepl2.so" getenv >/dev/null 2>&1
+rc=$?
+# watch-mode run against a fresh victim
+cat > "$TMP/hjvictim2.c" <<'HJVICTIM2'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(void)
+{
+    for (int i = 0; i < 8; i++) {
+        printf("HOME=%s\n", getenv("HOME"));
+        fflush(stdout);
+        sleep(1);
+    }
+    return 0;
+}
+HJVICTIM2
+gcc -O0 -o "$TMP/hjvictim2" "$TMP/hjvictim2.c" \
+    || { echo "FAIL: build hjvictim2"; exit 1; }
+
+"$TMP/hjvictim2" > "$TMP/hj3.out" 2>&1 &
+HJ2_PID=$!
+sleep 2
+"$ROOT/symhijack" -w "$HJ2_PID" "$TMP/hjrepl2.so" getenv \
+    > "$TMP/hj3.trace.out" 2>&1 &
+WATCH_PID=$!
+sleep 3
+kill -INT "$WATCH_PID"
+wait "$WATCH_PID"
+sleep 1
+kill "$HJ2_PID" 2>/dev/null
+wait "$HJ2_PID" 2>/dev/null
+
+if grep -q '/watched' "$TMP/hj3.out" \
+   && grep -q 'HOME=/home/' "$TMP/hj3.out" \
+   && grep -q 'original GOT values restored' "$TMP/hj3.trace.out"; then
+    echo "ok: symhijack watch mode redirected then restored the GOT"
+else
+    echo "FAIL: symhijack watch mode"
+    cat "$TMP/hj3.trace.out"
+    cat "$TMP/hj3.out"
+    fail=1
+fi
+
+if [ $fail -eq 0 ]; then
+    echo "all tests passed"
+else
+    echo "tests failed"
+fi
+exit $fail
