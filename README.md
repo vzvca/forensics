@@ -1,9 +1,12 @@
 # forensics
 
 > [!NOTE]
-> Le code de ce dépôt a été écrit par l'agent IA de Mistral (Vibe Code,
-> propulsé par le modèle GLM de Z.ai) dans le cadre du programme de bêta
-> de codage autonome de Mistral AI.
+> **About the authorship**
+>
+> This program and its documentation were written from A to Z by
+> **mistral-vibe** (Mistral AI's coding agent, powered by the GLM model),
+> under human supervision: the project owner defined the goals and
+> reviewed, tested and merged each step.
 
 Tools for debugging running processes on Linux (x86_64).
 
