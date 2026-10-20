@@ -1,7 +1,10 @@
-main: main.c factorial.so
-	$(CC) -o $@ -g3 $< factorial.so
+main: main.c bad.so good.so
+	$(CC) -o $@ -g3 $< bad.so
 
-factorial.so: factorial.c
+bad.so: bad-factorial.c
+	$(CC) -shared -g3 -o $@ $<
+
+good.so: good-factorial.c
 	$(CC) -shared -g3 -o $@ $<
 
 

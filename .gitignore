@@ -8,4 +8,5 @@ common_pt.o
 common_target.o
 common_remote.o
 example/main
-example/factorial.so
+example/*.so
+

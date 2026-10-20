@@ -62,9 +62,12 @@ Mechanism (shares the GOT enumeration with symtrace):
 With `-w`, symhijack stays attached and restores the original GOT values
 when the target exits or on Ctrl-C.
 
-Limitations: x86_64 only; calls that stay internal to the defining library
+Limitation: x86_64 only; calls that stay internal to the defining library
 (without crossing a PLT/GOT) are not redirected; the replacement library is
 loaded with RTLD_NOW.
+
+Limitation: dlopen needs to be defined in libc (which start with debian 12)
+
 
 ### dwproto
 
@@ -72,6 +75,9 @@ Dump DWARF function prototypes in the `prototypes.h` format used by
 symtrace.
 
     dwproto <binary-or-library> [function]
+
+Can be used to modify `prototypes.h` to add more prototypes.
+
 
 ## Build and tests
 
@@ -82,3 +88,46 @@ The shared tooling lives in `src/common/`: ptrace helpers (`pt.c`), target
 module/GOT enumeration reused by symtrace and symhijack (`target.c`), and
 remote function-call machinery used to run dlopen/dlsym inside the traced
 process (`remote.c`).
+
+## Example
+
+There is an example:
+
+    cd example
+    ./runme.sh
+
+Expected output (debian trixie):
+
+    == building
+    cc -shared -g3 -o bad.so bad-factorial.c
+    cc -shared -g3 -o good.so good-factorial.c
+    cc -o main -g3 main.c bad.so
+    == ldd output
+	    linux-vdso.so.1 (0x00007ffcf55a8000)
+	    bad.so => /home/vzvca/forensics/example/bad.so (0x00007f1d28dba000)
+	    libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f1d28bc4000)
+	    /lib64/ld-linux-x86-64.so.2 (0x00007f1d28dc6000)
+    == symfind facto
+    symfind: facto: No such file or directory
+    == symtrace output
+    symtrace: prototype from debug info: facto(int)
+    symtrace: prototype from debug info: facto(int)
+    symtrace: tracing 'facto' in pid 596 (2 GOT slots) - press Ctrl-C to stop
+    facto(1) = 1
+    facto(2) = 2
+    facto(3) = 6
+    facto(4) = 24
+    facto(5) = 120
+    facto(6) = 720
+    GOOD => 6! = 720
+    facto(0) = 0
+    BAD  => 0! = 0
+    symtrace: program exited (status 0)
+    facto: 7 calls intercepted
+    == symhijack output
+    symhijack: /home/vzvca/forensics/example/good.so loaded in pid 598 (handle 0x55ebec5452e0)
+    symhijack: replacement facto at 0x7f7d6b41e109
+    symhijack: 2 GOT slots for 'facto' redirected to 0x7f7d6b41e109
+    symhijack: detached, calls now land in the replacement
+    GOOD => 6! = 720
+    BAD  => 0! = 1

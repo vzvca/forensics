@@ -4,6 +4,7 @@ extern int facto(int);
 
 int main()
 {
-  printf("%d\n", facto(6));
+  printf("GOOD => 6! = %d\n", facto(6));
+  printf("BAD  => 0! = %d\n", facto(0));
   return 0;
 }
