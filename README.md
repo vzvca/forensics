@@ -108,7 +108,7 @@ Expected output (debian trixie):
 	    libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f1d28bc4000)
 	    /lib64/ld-linux-x86-64.so.2 (0x00007f1d28dc6000)
     == symfind facto
-    symfind: facto: No such file or directory
+    /home/localadmin/vincent/forensics/example/bad.so: facto
     == symtrace output
     symtrace: prototype from debug info: facto(int)
     symtrace: prototype from debug info: facto(int)
